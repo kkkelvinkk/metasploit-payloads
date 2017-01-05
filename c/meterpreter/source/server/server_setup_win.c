@@ -6,6 +6,7 @@
 #include <ws2tcpip.h>
 
 #include "win/server_transport_winhttp.h"
+#include "win/server_transport_windns.h"
 #include "win/server_transport_tcp.h"
 #include "win/server_transport_named_pipe.h"
 #include "../../common/packet_encryption.h"
@@ -121,6 +122,15 @@ static Transport* create_transport(Remote* remote, MetsrvTransportCommon* transp
 			*size = sizeof(MetsrvTransportNamedPipe);
 		}
 		transport = transport_create_named_pipe((MetsrvTransportNamedPipe*)transportCommon);
+	}
+	else if (wcsncmp(transportCommon->url, L"dns", 3) == 0)
+	{
+		if (size)
+		{
+			*size = sizeof(MetsrvTransportDns);
+		}
+		transport = transport_create_dns((MetsrvTransportDns*)transportCommon);
+		
 	}
 	else
 	{
