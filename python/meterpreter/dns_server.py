@@ -313,11 +313,13 @@ def dns_response(data):
             if mc:
                 TLV_RES['rdy'] = True
         else:
-            m1 = re.match(r"(?P<base64>.*)\.t\.(?P<idx>\d+)\.(?P<client>\w)\." + D, qn)
+            m1 = re.match(r"(?P<base64>.*)\.(?P<padd>\d+)\.(?P<idx>\d+)\.(?P<client>\w)\." + D, qn)
             if m1 and 'recieved_in' in TLV_RES:
                 print("INDATA: DATA CAME")
                 base_in = m1.group('base64')
                 index_in = int(m1.group('idx'))
+                
+                padding = "" + ("=" * int(m1.group('padd')))
                 
                 base_in = re.sub(r"\.", "", base_in)
                 base_in = re.sub(r"\-", "+", base_in)
@@ -325,7 +327,7 @@ def dns_response(data):
                 
                 lnx = len(base_in)
                 
-                print "\nsize: " + str(TLV_RES['size_in']) + " index: " + str(index_in) + " length " + str(lnx) + " base64: " + base_in + "\n";
+                print "\nsize: " + str(TLV_RES['size_in']) + " index: " + str(index_in) + " length " + str(lnx) + " base64: " + base_in + " padd:" +  str(padding) +"\n";
                 
                 if TLV_RES['size_in'] > 0:
                     
@@ -344,9 +346,14 @@ def dns_response(data):
                         
                     if (TLV_RES['size_in']  == 0):
                         print "RECIEVED FULL PACKET\n";
-                                
-                        TLV_RES['full_in'] = base64.b64decode(TLV_RES['base64']  + ("=" * (len(TLV_RES['base64']) % 3)));
-                        print TLV_RES['full_in']
+                        try:
+                            TLV_RES['full_in'] = base64.b64decode(TLV_RES['base64'] + padding);
+                            print TLV_RES['full_in']
+                        except Exception  as e:
+                            print TLV_RES['base64']
+                            print " ---> "
+                            print "Server ERROR " + str(e)
+                            TLV_RES['full_in']=""
                         TLV_RES['rdy'] = True
                         print("INDATA: OK, more")
                     
