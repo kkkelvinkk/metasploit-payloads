@@ -243,14 +243,21 @@ def xor_bytes(key, data):
     return ''.join(chr(ord(data[i]) ^ ord(key[i % len(key)])) for i in range(len(data)))
     
 def dns_response(data):
+   
+    try:
+        request = DNSRecord.parse(data)
+        return dns_response_(request)
+    except Exception as e:
+        print "Parse error"
+        return None
+        
+        
+def dns_response_(request):
     global CONNECTED
     global LPORT
     global TLV_REQ
     global TLV_RES
-    global curr_sub_
-    
-    request = DNSRecord.parse(data)
-
+    global curr_sub_       
     print("\n\nINCOMING: ")
 
     reply = DNSRecord(DNSHeader(id=request.header.id, qr=1, aa=1, ra=1), q=request.q)
@@ -405,7 +412,9 @@ class BaseRequestHandlerDNS(SocketServer.BaseRequestHandler):
         try:
             data = self.get_data()
             print(len(data), data)  # repr(data).replace('\\x', '')[1:-1]
-            self.send_data(dns_response(data))
+            dns_ans = dns_response(data)
+            if dns_ans:
+                self.send_data(dns_ans)
         except Exception:
             traceback.print_exc(file=sys.stderr)
 
