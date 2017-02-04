@@ -933,6 +933,7 @@ Transport* transport_create_dns(MetsrvTransportDns* config)
 	transport->type = METERPRETER_TRANSPORT_DNS;
 	
 	domain = wcsstr(config->common.url, L"dns://");
+    transport->url = _wcsdup(config->common.url);
 	
 	if (domain == NULL){
 		domain = config->common.url;
