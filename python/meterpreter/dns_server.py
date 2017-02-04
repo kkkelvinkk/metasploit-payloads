@@ -226,15 +226,18 @@ def add_meter_request(data):
     
     return True
     
-def get_meter_response():
+def get_meter_response(wait=600):
     global TLV_RES
-    zero = 0.0
-    while not bool(TLV_RES['rdy']) and zero < 600:
+    zero = 0
+    print "WAITING FOR RESPONSE"
+    while not bool(TLV_RES['rdy']) and zero < (wait * 10):
         time.sleep(0.1)
         zero += 1
     if 'full_in' in TLV_RES:
+        print "GOT RESPONSE"
         data = TLV_RES['full_in']
     else:
+        print "NO RESPONSE"
         data = None
     TLV_RES = {'rdy': False}
     return data
@@ -419,7 +422,6 @@ class BaseRequestHandlerDNS(SocketServer.BaseRequestHandler):
             traceback.print_exc(file=sys.stderr)
 
 class MeterBaseRequestHandler(SocketServer.BaseRequestHandler):
-
     def get_data(self):
         data = self.request.recv(256)
         return data
@@ -452,19 +454,36 @@ class MeterBaseRequestHandler(SocketServer.BaseRequestHandler):
         
         #Session
         while True:
+            s.settimeout(0.5)
             try:
+                print("WAITING FOR THE HEADER")
                 data = s.recv(8) # get header
+            except socket.timeout:
+                print "EPTY IN"
+                data = None
+            except ssl.SSLError, e:
+                if str(e) == "('The read operation timed out',)":
+                    print "EPTY IN2"
+                    data = None
+                else:
+                    print "Server ERROR " + str(e) + "  '" + str(e)+"'"
+                    data = None
+                    s = None
+                    break
             except Exception  as e:
-                print "Server ERROR " + str(e)
+                print "Server ERROR2 " + str(e)
                 data = None
                 s = None
                 break
+            s.settimeout(None)
                 
             if data is None:
                 print "EMPTY"
-                time.sleep(1)
-                continue
+                #time.sleep(1)
+                #continue
+                return_tlv = get_meter_response(1)
             else:
+                print("PARSE HEADER")
                 # Parse header
                 xor_key = data[:4][::-1]
                 header_length = xor_bytes(xor_key, data[4:8])
@@ -484,22 +503,25 @@ class MeterBaseRequestHandler(SocketServer.BaseRequestHandler):
                         s = None
                         break
                 # Ready
-                  
+                s.settimeout(None)  
                 print "Server said {}".format(" ".join([ hex(ord(ch))[2:] for ch in data ]))
                 add_meter_request(data)
                 return_tlv = get_meter_response()
-                if return_tlv:
-                    print "Client said {}".format(" ".join([ hex(ord(ch))[2:] for ch in return_tlv ]))
-                    try:
-                        s.write(return_tlv)
-                    except Exception  as e:
-                        print "Server ERROR 2 " + str(e)
-                        data = None
-                        s = None
-                        break
-                    print "SENT"
                 
-                time.sleep(2)
+            
+            if return_tlv:
+                print "Client said {}".format(" ".join([ hex(ord(ch))[2:] for ch in return_tlv ]))
+                try:
+                    s.write(return_tlv)
+                    
+                except Exception  as e:
+                    print "Server ERROR 2 " + str(e)
+                    data = None
+                    s = None
+                    break
+                print "SENT"
+            
+            time.sleep(2)
 
             
 class TCPRequestHandler(BaseRequestHandlerDNS):
