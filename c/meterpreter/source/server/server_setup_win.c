@@ -260,9 +260,22 @@ static void config_create(Remote* remote, LPBYTE uuid, MetsrvConfig** config, LP
 	do
 	{
 		// extend memory appropriately
-		DWORD neededSize = t->type == METERPRETER_TRANSPORT_TCP ? sizeof(MetsrvTransportTcp) : 
-			(t->type == METERPRETER_TRANSPORT_PIPE ? sizeof(MetsrvTransportNamedPipe) : sizeof(MetsrvTransportHttp));
-
+		DWORD neededSize = 0;
+		switch (t->type)
+		{
+			case METERPRETER_TRANSPORT_TCP:
+				neededSize = sizeof(MetsrvTransportTcp);
+				break;
+			case METERPRETER_TRANSPORT_PIPE:
+				neededSize = sizeof(MetsrvTransportNamedPipe);
+				break;
+			case METERPRETER_TRANSPORT_DNS:
+				neededSize = sizeof(MetsrvTransportDns);
+				break;
+			default:
+				neededSize = sizeof(MetsrvTransportHttp);
+				break;
+		}
 		dprintf("[CONFIG] Allocating %u bytes for transport, total of %u bytes", neededSize, s);
 
 		sess = (MetsrvSession*)realloc(sess, s + neededSize);
@@ -295,6 +308,11 @@ static void config_create(Remote* remote, LPBYTE uuid, MetsrvConfig** config, LP
 			case METERPRETER_TRANSPORT_HTTPS:
 			{
 				transport_write_http_config(t, (MetsrvTransportHttp*)target);
+				break;
+			}
+			case METERPRETER_TRANSPORT_DNS:
+			{
+				transport_write_dns_config(t, (MetsrvTransportDns*)target);
 				break;
 			}
 		}

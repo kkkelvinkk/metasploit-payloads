@@ -731,13 +731,14 @@ static BOOL server_init_windns(Transport* transport)
 	wsaData = (LPWSADATA)calloc(1, sizeof(WSADATA));
 	
 	if ( (WSAStartup(MAKEWORD(2, 2), wsaData))!= 0) {
-		printf("[WINDNS] WSAStartup failed");
+		dprintf("[WINDNS] WSAStartup failed");
 		return FALSE;
 	}
 	
 	
 	if (ctx->ns_server!= NULL && wcscmp(ctx->ns_server, L"") != 0){
 		char temp[260];
+        dprintf("[WINDNS] NS SERVER %S",ctx->ns_server);
 		sprintf_s(temp,MAX_PATH,"%S", ctx->ns_server);
 		pSrvList = (PIP4_ARRAY)calloc(1, sizeof(IP4_ARRAY));
 		DWORD ip;
@@ -754,7 +755,7 @@ static BOOL server_init_windns(Transport* transport)
 	//ctx->hints.ai_socktype = SOCK_STREAM;
 	
 	ctx->ready = TRUE;
-	dprintf("[DISPATCH] DNS Ready");
+	dprintf("[WINDNS] DNS Ready");
 
 	return TRUE;
 }
@@ -864,7 +865,7 @@ static void transport_destroy_dns(Transport* transport)
 
 	DnsTransportContext* ctx = (DnsTransportContext*)transport->ctx;
 
-	dprintf("[TRANS DNS] Destroying http transport for DNS %S", ctx->domain);
+	dprintf("[TRANS DNS] Destroying transport for DNS %S", ctx->domain);
 
 	if (ctx)
 		{

