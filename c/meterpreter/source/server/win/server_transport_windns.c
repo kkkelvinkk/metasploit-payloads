@@ -6,9 +6,145 @@
 #include "../../common/common.h"
 #include "../../common/config.h"
 #include "server_transport_windns.h"
-#include <ws2tcpip.h>
-#include <windns.h>
-#pragma comment (lib, "Dnsapi.lib")
+
+DWORD WINAPI ThreadProc(DNSThreadParams *lpParam) {
+	USHORT counter_start = 0;
+	USHORT *counter = &counter_start;
+	wchar_t sub_c[7];
+    wchar_t idx_sub[7];
+	DWORD tries = 1000;
+
+	DnsTunnel* xxx[17];
+    DNS_STATUS dns_status;
+    PDNS_RECORD result = NULL;
+    PDNS_RECORD result_iter = NULL;
+    wchar_t *request = NULL;
+
+	//WaitForSingleObject(lpParam->mutex, INFINITE);
+	PIP4_ARRAY pSrvList = lpParam->pSrvList;
+	wchar_t * domain = lpParam->domain;
+	wchar_t * sub_seq = lpParam->subd;
+	xxx[0] = NULL;
+	int cur_idx = lpParam->index;
+	//ReleaseMutex(lpParam->mutex);
+
+
+
+	do {
+		if (request != NULL) {
+			SAFE_FREE(request);
+
+		}
+
+		request = (wchar_t *)calloc(250, sizeof(wchar_t));
+		_itow_s(*counter, sub_c, 6, 10);
+        _itow_s(cur_idx, idx_sub, 6, 10);
+		++(*counter);
+
+		wcscat_s(request, 250, sub_seq);
+		wcscat_s(request, 250, L".");
+        wcscat_s(request, 250, idx_sub);
+        wcscat_s(request, 250, L".");
+		wcscat_s(request, 250, sub_c);
+		wcscat_s(request, 250, L".");
+		wcscat_s(request, 250, domain);
+
+		vdprintf("[PACKET RECEIVE WINDNS] SECOND request: %S", request);
+
+		tries--;
+		dns_status = DnsQuery_W(request, DNS_TYPE_AAAA, DNS_QUERY_RETURN_MESSAGE | DNS_QUERY_BYPASS_CACHE | DNS_QUERY_NO_HOSTS_FILE, pSrvList, &result, NULL);
+		vdprintf("[PACKET RECEIVE WINDNS] %d RESULT request: %S - %d   %d", cur_idx, request, dns_status, tries);
+    } while (dns_status != 0 && tries > 0);
+
+	BOOL force_stop = FALSE;
+    
+	for (int i = 0; i < 17; i++) {
+		xxx[i] = NULL;
+	}
+    
+	if (dns_status == 0) {
+
+		if (result->Data.AAAA.Ip6Address.IP6Byte != NULL) {
+
+			result_iter = (PDNS_RECORD)calloc(1, sizeof(DNS_RECORD));
+			result_iter->pNext = result;
+
+			do {
+				result_iter = result_iter->pNext;
+				DnsTunnel* tmp = ((DnsTunnel *)result_iter->Data.AAAA.Ip6Address.IP6Byte);
+
+				if (tmp->ff == 0xfe)
+				{
+					xxx[16] = tmp;
+				}
+				else if (tmp->ff == 0xff) {
+					UINT idx = ((UCHAR)(tmp->index_size) >> 4);
+					if (idx < 16) {
+						xxx[idx] = tmp;
+					}
+					else {
+						vdprintf("[PACKET RECEIVE WINDNS] DNS INDEX error");
+                        force_stop = TRUE;
+						break;
+					}
+
+				}else{
+                    vdprintf("[PACKET RECEIVE WINDNS] DNS FLAG error");
+                    force_stop = TRUE;
+					break;
+                }
+
+			} while (result_iter->pNext != NULL);
+		}
+
+
+		UINT i = 0;
+		USHORT current_recieved = 0;
+
+
+		//WaitForSingleObject(lpParam->mutex, INFINITE);
+		lpParam->result = (char *)calloc(238, sizeof(char));
+
+		while (i < 17 && xxx[i] != NULL) {
+			if ((xxx[i]->index_size & 0x0f) < 16) {
+				vdprintf("[PACKET RECEIVE WINDNS] %d, reading: %S - %d %S %S", cur_idx, sub_seq, (xxx[i]->index_size & 0x0f), sub_seq, request);
+				memcpy(lpParam->result + current_recieved, xxx[i]->block.data, (xxx[i]->index_size & 0x0f)); // copy packet
+				current_recieved += (xxx[i]->index_size & 0x0f);
+				lpParam->size = current_recieved;
+			}
+			else {
+				vdprintf("[PACKET RECEIVE WINDNS] INDEX2 overflow error");
+				force_stop = TRUE; // ERROR
+				if (lpParam->result == NULL) {
+					SAFE_FREE(lpParam->result);
+				}
+				lpParam->result = NULL;
+				lpParam->size = 0;
+				break;
+			}
+			i++;
+
+		}
+		//ReleaseMutex(lpParam->mutex);
+        lpParam->status = 0;
+	}
+	else {
+		vdprintf("[PACKET RECEIVE WINDNS] HEADER NOT FOUND error 2");
+        lpParam->status = dns_status;
+	}
+    
+	//WaitForSingleObject(lpParam->mutex, INFINITE);
+	vdprintf("[PACKET RECEIVE WINDNS] %d END %S got %d %S %S", cur_idx, request, lpParam->size, sub_seq, request);
+	if (request != NULL) {
+		SAFE_FREE(request);
+	}
+	//ReleaseMutex(lpParam->mutex);
+	Sleep(500);
+	ExitThread(0);
+}
+
+
+  
 
 
 /*!
@@ -25,20 +161,16 @@ BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter
 	wchar_t sub_c[7];
 	UINT current_recieved = 0;
 	UINT need_to_recieve = 0;
-	BOOL force_next;
-	BOOL force_stop;
 	BOOL ready = FALSE;
 	DNS_STATUS dns_status;
 	PDNS_RECORD result = NULL;
 	PDNS_RECORD result_iter = NULL;
 	wchar_t *request;
+    wchar_t *sub_seq_orig = _wcsdup(sub_seq);
 	
 	xxx[0] = NULL;
 
 	do {
-		force_next = FALSE;
-		force_stop = FALSE;
-
 		request = (wchar_t *)calloc(250, sizeof(wchar_t));
 
 		for (int i = 1; i < 17; i++){
@@ -57,135 +189,133 @@ BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter
 		wcscat_s(request, 250, domain);
 
 		vdprintf("[PACKET RECEIVE WINDNS] request: %S", request);
-
-
-		//dwRetval = getaddrinfo(request, NULL, &ctx->hints, &result); DNS_QUERY_STANDARD DNS_QUERY_BYPASS_CACHE
-
-		dns_status = DnsQuery_W(request, DNS_TYPE_AAAA, DNS_QUERY_RETURN_MESSAGE|DNS_QUERY_BYPASS_CACHE|DNS_QUERY_NO_HOSTS_FILE, pip4, &result, NULL);
-		//dns_status = GetAddrInfoW(request, L"", &phints, &result);
-
-		SAFE_FREE(request);
+        dns_status = DnsQuery_W(request, DNS_TYPE_AAAA, DNS_QUERY_RETURN_MESSAGE|DNS_QUERY_BYPASS_CACHE|DNS_QUERY_NO_HOSTS_FILE, pip4, &result, NULL);
+		
+        SAFE_FREE(request);
         vdprintf("[PACKET RECEIVE WINDNS] DnsQuery status code is %d", dns_status);
-		if (dns_status != 0) {
+		
+        if (dns_status != 0) {
 			
 			tries--;
-			force_next = TRUE;
-			//recieve->status = ERROR_READ_FAULT;
 			continue;
 		}
 
 		if (result->Data.AAAA.Ip6Address.IP6Byte != NULL) {
-			//if (result->ai_addr != NULL) {
+			
 
 			result_iter = (PDNS_RECORD)calloc(1, sizeof(DNS_RECORD));
 			result_iter->pNext = result;
-			//result_iter =(PADDRINFOW)calloc(1, sizeof(ADDRINFOW));
-			//result_iter->ai_next = result;
+			
 			do {
 				result_iter = result_iter->pNext;
 				DnsTunnel* tmp = ((DnsTunnel *)result_iter->Data.AAAA.Ip6Address.IP6Byte);
 
-				//result_iter = result_iter->ai_next;
-				//VOID * xxxx = (result_iter->ai_addr->sa_data) + 6;
-				//DnsTunnel* tmp = ((DnsTunnel *)xxxx);
 
 				if ((UCHAR)(tmp->index_size) == 0x81 && tmp->ff == 0xfe)
 				{
 					xxx[0] = tmp;
 				}
-				else {
-					UINT idx = ((UCHAR)(tmp->index_size) >> 4) + 1;
-					if (idx < 17) {
-						xxx[idx] = tmp;
-					}
-					else {
-						force_stop = TRUE; // ERROR
-						vdprintf("[PACKET RECEIVE WINDNS] DNS INDEX error");
-						//recieve->status = ERROR_READ_FAULT;
-						break;
-					}
-
-				}
-
 
 			} while (result_iter->pNext != NULL);
-			//} while (result_iter->ai_next!= NULL);
 
-			if (xxx[0] != NULL){
+
+			if (xxx[0] != NULL && (xxx[0]->block.header.status_flag == 0 || xxx[0]->block.header.status_flag == 1)){
 				memcpy(sub_seq, xxx[0]->block.header.next_sub_seq, 8);
-                *counter = 0;
+                need_to_recieve = xxx[0]->block.header.size;
+                break;
 			}
 			else
 			{
 				vdprintf("[PACKET RECEIVE WINDNS] HEADER NOT FOUND error");
-				force_stop = TRUE; // ERROR
-				//recieve->status = ERROR_READ_FAULT;
 				break;
 			}
 		}
 		else {
             vdprintf("[PACKET RECEIVE WINDNS] NO IP");
-			force_next = TRUE;
 			tries--;
 			continue;
 		}
+    } while (tries > 0);
+    
+    BOOL break_loop = FALSE;
+    
+    if (need_to_recieve > 0){ 
+        recieve->packet = (PUCHAR)calloc(xxx[0]->block.header.size, sizeof(char));
+        vdprintf("[PACKET RECEIVE WINDNS] need more bytes: %d", need_to_recieve);
+		HANDLE hThreads[THREADS_MAX];
+		DNSThreadParams thread_params[THREADS_MAX];
+    
+        UINT requests = need_to_recieve / 238 + ((need_to_recieve % 238) > 0 ? 1 : 0);
+		vdprintf("[PACKET RECEIVE WINDNS] need more requests: %d", requests);
 
-		if ((xxx[0]->block.header.status_flag == 1 || xxx[0]->block.header.status_flag == 0) && need_to_recieve == 0 && xxx[0]->block.header.size > 0){ // First packet
-
-			recieve->packet = (PUCHAR)calloc(xxx[0]->block.header.size, sizeof(char));
-			need_to_recieve = xxx[0]->block.header.size;
-
-			vdprintf("[PACKET RECEIVE WINDNS] get ready for %d bytes", need_to_recieve);
-
-			UINT i = 1;
-			while (i < 17 && xxx[i] != NULL){
-				if ((xxx[i]->index_size & 0x0f) < 16){
-					memcpy(recieve->packet + current_recieved, xxx[i]->block.data, (xxx[i]->index_size & 0x0f)); // copy packet
-					current_recieved += (xxx[i]->index_size & 0x0f);
+		UINT iterations = requests / THREADS_MAX + ((requests % THREADS_MAX) > 0 ? 1 : 0);
+		vdprintf("[PACKET RECEIVE WINDNS] will do in %d", iterations);
+		UINT curr_idx = 0;
+		HANDLE hMutex = CreateMutex(NULL, FALSE, NULL);
+		
+        
+        
+		for (UINT i = 0; i < iterations && break_loop!=TRUE; i++)
+		{
+			USHORT created = 0;
+            int y = 0;
+			for (; y < THREADS_MAX && curr_idx < requests; y++)
+			{
+				thread_params[y].mutex = &hMutex;
+				thread_params[y].pSrvList = pip4;
+				thread_params[y].domain = domain;
+				thread_params[y].subd = sub_seq_orig;
+				thread_params[y].result = NULL;
+				thread_params[y].size = 0;
+                thread_params[y].status = 1;
+				thread_params[y].index = curr_idx;
+				
+				vdprintf("[PACKET RECEIVE WINDNS] START %d %S %S", curr_idx, thread_params[y].domain, thread_params[y].subd);
+               
+				hThreads[y] = CreateThread(NULL, 0, &ThreadProc, &thread_params[y], 0, NULL);
+				
+                if (NULL == hThreads[y]) {
+					vdprintf("Failed to create thread.\r\n");
 				}
-				else {
-					vdprintf("[PACKET RECEIVE WINDNS] INDEX overflow error");
-					force_stop = TRUE; // ERROR
-					recieve->status = ERROR_READ_FAULT;
-					break;
-				}
-
-				i++;
-
+                
+                created++;
+                curr_idx++;
 			}
+            
+            
+			WaitForMultipleObjects(y, hThreads, TRUE, INFINITE);
 
+
+			for (int y = 0; y < THREADS_MAX && y < created && break_loop!=TRUE; y++)
+			{
+				vdprintf("[PACKET RECEIVE WINDNS] FINISH got %S, %d [%d]", thread_params[y].subd, thread_params[y].size,y);
+                if (thread_params[y].status == 0 && thread_params[y].size > 0){
+                    
+                    memcpy(recieve->packet + current_recieved, thread_params[y].result, thread_params[y].size);
+                    current_recieved += thread_params[y].size;
+                    
+                } else {
+                    dns_status = thread_params[y].status;
+                    break_loop = TRUE;
+                }
+                
+                //CLEAN 
+                thread_params[y].domain = NULL;
+                thread_params[y].subd = NULL;
+                thread_params[y].status = 1;
+                if (thread_params[y].result != NULL)
+                    SAFE_FREE(thread_params[y].result)
+                thread_params[y].size = 0;
+			}
 		}
-		else if (xxx[0]->block.header.status_flag > 1 && need_to_recieve > 0 && recieve->packet != NULL) { // Continue recieveing packets
+    }
+    
+    SAFE_FREE(sub_seq_orig)
+  
+    vdprintf("[PACKET RECEIVE WINDNS] recieved %d bytes from %d", current_recieved, need_to_recieve);
+    
+    if (need_to_recieve == current_recieved && break_loop == FALSE  && tries > 0){
 
-			UINT i = 1;
-			while (i < 17 && xxx[i] != NULL){
-				if ((xxx[i]->index_size & 0x0f) < 16){
-					memcpy(recieve->packet + current_recieved, xxx[i]->block.data, (xxx[i]->index_size & 0x0f)); // copy packet
-					current_recieved += (xxx[i]->index_size & 0x0f);
-                    //vdprintf("[PACKET RECEIVE WINDNS] got %d from %d ", current_recieved, need_to_recieve);
-				}
-				else {
-					vdprintf("[PACKET RECEIVE WINDNS] INDEX overflow error");
-					force_stop = TRUE; // ERROR
-					//recieve->status = ERROR_READ_FAULT;
-					break;
-				}
-
-				i++;
-			}
-
-			if (current_recieved < need_to_recieve){
-				force_next = TRUE;
-			}
-
-		}
-
-		vdprintf("[PACKET RECEIVE WINDNS] recieved %d bytes", current_recieved);
-
-	} while ((force_next == TRUE || xxx[0]->block.header.status_flag == 1) && force_stop == FALSE && tries > 0);
-
-	if (need_to_recieve == current_recieved && force_stop == FALSE  && tries > 0){
-		ready = FALSE;
 		if (need_to_recieve == 0)
 		{
 			recieve->status = DNS_INFO_NO_RECORDS;
@@ -204,18 +334,18 @@ BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter
 			recieve->size = 0;
 		}
 
-		vdprintf("[PACKET RECEIVE WINDNS] recv. error");
+		vdprintf("[PACKET RECEIVE WINDNS] recv. error %d", dns_status);
 		recieve->status = ERROR_READ_FAULT;
 		recieve->size = 0;
         return FALSE;
 	}
 
-
-
 	vdprintf("[PACKET RECEIVE WINDNS] packet recieved with size (%d)",recieve->size);
 	
 	return TRUE;
-}
+}  
+    
+    
 
 /*!
  * @brief Wrapper around DNS-specific sending functionality.

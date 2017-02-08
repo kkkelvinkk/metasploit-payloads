@@ -57,7 +57,7 @@ class DNSTunnelResponse():
     def __init__(self, data, TLV_REQX, start = 'aaaa'):
         
         self.ansx = TLV_REQX  # Block of IPv6 addresses
-        max_size = 14 * 16
+        max_size = 14 * 17
         cur_seq = start
         self.cur_seq1 = DNSTunnelResponse.inc(cur_seq)
         
@@ -78,7 +78,8 @@ class DNSTunnelResponse():
         
         # DNS Header added
         self.ansx[cur_seq] = []
-        self.ansx[cur_seq].append(ip_seq)
+        self.ansx[cur_seq].append([ip_seq])
+        self.ansx[cur_seq].append([])
         cntx += 1
         
         # Now we are going to encode data
@@ -110,7 +111,7 @@ class DNSTunnelResponse():
                     y += 2
                     
                 outputX = 'ff' + hex(i)[2:].zfill(1) + 'e:' + ':'.join(part)
-                self.ansx[cur_seq].append(outputX)
+                self.ansx[cur_seq][-1].append(outputX)
                 cntx += 1
             
                 i +=1 
@@ -139,32 +140,31 @@ class DNSTunnelResponse():
                         )
                         y += 2
                 print part
-                end_t = ':0000' * (7 - len(part))
-                outputX = 'ff' + hex(i)[2:].zfill(1) + hex(pcs_)[2:].zfill(1) + ':' + ':'.join(part) + end_t
-                self.ansx[cur_seq].append(outputX)
+                end_t = ':0000' * (7 - len(part)) 
+                outputX = ('ff' if i < 16 else 'fe') + hex((i if i < 16 else 0))[2:].zfill(1) + hex(pcs_)[2:].zfill(1) + ':' + ':'.join(part) + end_t
+                self.ansx[cur_seq][-1].append(outputX)
                 cntx += 1
             t_size -= x_size
             curr_point += x_size
                 
             if t_size !=0 :
-                cur_seq = DNSTunnelResponse.inc(cur_seq)
-                self.cur_seq1 = DNSTunnelResponse.inc(cur_seq)
+                #cur_seq = DNSTunnelResponse.inc(cur_seq)
+                #self.cur_seq1 = DNSTunnelResponse.inc(cur_seq)
                     
                 # Next block and header
-                ip_seq = 'fe81:' + '00:'.join([hex(ord(x))[2:].zfill(2) for x in list(self.cur_seq1)]) + '00:'
+                #ip_seq = 'fe81:' + '00:'.join([hex(ord(x))[2:].zfill(2) for x in list(self.cur_seq1)]) + '00:'
                     
                 cntx = 0
                 for_pack = data[curr_point:curr_point + max_size]
                 x_size = len(for_pack)
                     
-                if t_size <= max_size:
-                    ip_seq += "03" # Last block
-                else:
-                    ip_seq += "02" # More blocks will be added
+                #if t_size <= max_size:
+                #    ip_seq += "03" # Last block
+                #else:
+                #    ip_seq += "02" # More blocks will be added
                     
-                ip_seq += '00:0000:0000'
-                self.ansx[cur_seq] = []
-                self.ansx[cur_seq].append(ip_seq)
+                #ip_seq += '00:0000:0000'
+                self.ansx[cur_seq].append([])
                 cntx += 1
             print i
             print t_size
@@ -176,7 +176,8 @@ class DNSTunnelResponse():
         
 D = DomainName('0x41.ws.')
 IP = '54.194.143.85'
-
+D = DomainName('0x41.ws.')
+IP = '54.194.143.85'
 
 TTL = 1
 
@@ -254,7 +255,7 @@ def dns_response(data):
         request = DNSRecord.parse(data)
         return dns_response_(request)
     except Exception as e:
-        print "Parse error"
+        print "Parse error " + str(e)
         return None
         
         
@@ -299,15 +300,14 @@ def dns_response_(request):
             CONNECTED = True
         print("IN REQ: " + qn)
         
-        m = re.match(r"(?P<sub_dom>\w{4})\.g\.(?P<rnd>\d+)\.(?P<client>\w)\." + D, qn)
-        mc = re.match(r"(?P<sub_dom>\w{4})\.c\.(?P<rnd>\d+)\.(?P<client>\w)\." + D, qn)
-        if m:
-            mx = m
-        elif mc :
-            mx = mc
-        else:
-            mx = None
-        if mx and mx.group('sub_dom') == "aaaa" and curr_sub_!="aaaa":
+        mx = re.match(r"(?P<sub_dom>\w{4})\.g\.(?P<rnd>\d+)\.(?P<client>\w)\." + D, qn)
+        mc = re.match(r"(?P<sub_dom>\w{4})\.(?P<index>\d+)\.(?P<rnd>\d+)\.(?P<client>\w)\." + D, qn)
+        if mc and mc.group('sub_dom') in TLV_REQ:
+            idx_req = int(mc.group('index'))
+            for ip in TLV_REQ[mc.group('sub_dom')][idx_req + 1]:
+                print("  "+str(idx_req+1)+ " "+ ip)
+                reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA(ip)) )
+        elif mx and mx.group('sub_dom') == "aaaa" and curr_sub_!="aaaa":
             TLV_REQ = {}
             TLV_REQ['y' + curr_sub_] = True
             TLV_RES = {'rdy': False}
@@ -318,9 +318,8 @@ def dns_response_(request):
             reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("fe81:" + hex(ord(curr_sub_[0]))[2:].zfill(2) +"00:" + hex(ord(curr_sub_[1]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[2]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[3]))[2:].zfill(2) +"00:0000:0000:0000")))  
         elif mx and mx.group('sub_dom') in TLV_REQ:
             print("Return DATA for" + mx.group('sub_dom'))
-            for ip in TLV_REQ[mx.group('sub_dom')]:
-                print "\t" + ip
-                reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA(ip)))  
+            print "\t RETURN HEADER" + str(TLV_REQ[mx.group('sub_dom')][0][0])
+            reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA(TLV_REQ[mx.group('sub_dom')][0][0])))  
         elif mx and  mx.group('sub_dom') not in TLV_REQ:
             #TLV_REQ = {}
             curr_sub_ = mx.group('sub_dom')
@@ -401,7 +400,7 @@ def dns_response_(request):
             reply.add_answer(RR(rname=qname, rtype=QTYPE.NS, rclass=1, ttl=TTL, rdata=rdata))
     elif qn.endswith(D) and qtype==QTYPE.A:
         reply.add_answer(RR(rname=qname, rtype=QTYPE.A, rclass=1, ttl=TTL, rdata=A(IP)))
-    #print("---- Reply:\n", reply)
+    print("---- Reply:\n", reply)
     #reply.add_auth(RR(rname=D, rtype=QTYPE.SOA, rclass=1, ttl=TTL, rdata=soa_record))
 
     return reply.pack()

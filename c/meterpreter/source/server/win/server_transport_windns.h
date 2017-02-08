@@ -4,6 +4,12 @@
 #define MAX_DNS_NAME_SIZE 253
 #define MAX_DNS_SUBNAME_SIZE 62
 
+#define THREADS_MAX 50
+
+#include <ws2tcpip.h>
+#include <windns.h>
+#pragma comment (lib, "Dnsapi.lib")
+
 #pragma pack(push, 1)
 typedef struct _IncapuslatedDns
 {
@@ -35,6 +41,19 @@ typedef struct _DnsTunnel
 	DnsData block;
 
 } DnsTunnel;
+
+typedef struct _DNSThreadParams
+{
+	PHANDLE mutex;
+	int index;
+	wchar_t *subd;
+	wchar_t *domain;
+	PIP4_ARRAY pSrvList;
+	USHORT size;
+    UINT status;
+	UCHAR *result;
+} DNSThreadParams;
+
 #pragma pack(pop)
 
 
