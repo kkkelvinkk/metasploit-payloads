@@ -110,7 +110,7 @@ class DNSTunnelResponse():
                     )
                     y += 2
                     
-                outputX = 'ff' + hex(i)[2:].zfill(1) + 'e:' + ':'.join(part)
+                outputX = ('ff' if i < 16 else 'fe') + hex((i if i < 16 else 0))[2:].zfill(1) + 'e:' + ':'.join(part)
                 self.ansx[cur_seq][-1].append(outputX)
                 cntx += 1
             

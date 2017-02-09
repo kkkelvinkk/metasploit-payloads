@@ -107,7 +107,7 @@ DWORD WINAPI ThreadProc(DNSThreadParams *lpParam) {
 
 		while (i < 17 && xxx[i] != NULL) {
 			if ((xxx[i]->index_size & 0x0f) < 16) {
-				vdprintf("[PACKET RECEIVE WINDNS] %d, reading: %S - %d %S %S", cur_idx, sub_seq, (xxx[i]->index_size & 0x0f), sub_seq, request);
+				//vdprintf("[PACKET RECEIVE WINDNS] %d, reading: %S - %d %S %S", cur_idx, sub_seq, (xxx[i]->index_size & 0x0f), sub_seq, request);
 				memcpy(lpParam->result + current_recieved, xxx[i]->block.data, (xxx[i]->index_size & 0x0f)); // copy packet
 				current_recieved += (xxx[i]->index_size & 0x0f);
 				lpParam->size = current_recieved;
