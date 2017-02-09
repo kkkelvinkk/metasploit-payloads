@@ -46,6 +46,7 @@ typedef struct _DNSThreadParams
 {
 	PHANDLE mutex;
 	int index;
+    int index_stop;
 	wchar_t *subd;
 	wchar_t *domain;
 	PIP4_ARRAY pSrvList;

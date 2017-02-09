@@ -12,7 +12,7 @@ DWORD WINAPI ThreadProc(DNSThreadParams *lpParam) {
 	USHORT *counter = &counter_start;
 	wchar_t sub_c[7];
     wchar_t idx_sub[7];
-	DWORD tries = 1000;
+	
 
 	DnsTunnel* xxx[17];
     DNS_STATUS dns_status;
@@ -28,110 +28,132 @@ DWORD WINAPI ThreadProc(DNSThreadParams *lpParam) {
 	int cur_idx = lpParam->index;
 	//ReleaseMutex(lpParam->mutex);
 
-
-
-	do {
-		if (request != NULL) {
-			SAFE_FREE(request);
-
-		}
-
-		request = (wchar_t *)calloc(250, sizeof(wchar_t));
-		_itow_s(*counter, sub_c, 6, 10);
-        _itow_s(cur_idx, idx_sub, 6, 10);
-		++(*counter);
-
-		wcscat_s(request, 250, sub_seq);
-		wcscat_s(request, 250, L".");
-        wcscat_s(request, 250, idx_sub);
-        wcscat_s(request, 250, L".");
-		wcscat_s(request, 250, sub_c);
-		wcscat_s(request, 250, L".");
-		wcscat_s(request, 250, domain);
-
-		vdprintf("[PACKET RECEIVE WINDNS] SECOND request: %S", request);
-
-		tries--;
-		dns_status = DnsQuery_W(request, DNS_TYPE_AAAA, DNS_QUERY_RETURN_MESSAGE | DNS_QUERY_BYPASS_CACHE | DNS_QUERY_NO_HOSTS_FILE, pSrvList, &result, NULL);
-		vdprintf("[PACKET RECEIVE WINDNS] %d RESULT request: %S - %d   %d", cur_idx, request, dns_status, tries);
-    } while (dns_status != 0 && tries > 0);
-
-	BOOL force_stop = FALSE;
+    lpParam->result = (UCHAR *)calloc(238 * (lpParam->index_stop - cur_idx), sizeof(UCHAR));
     
-	for (int i = 0; i < 17; i++) {
-		xxx[i] = NULL;
-	}
-    
-	if (dns_status == 0) {
+    for (; cur_idx < lpParam->index_stop; cur_idx++){
+        DWORD tries = 1000;
+        do {
+            
+            if (request != NULL) {
+                SAFE_FREE(request);
 
-		if (result->Data.AAAA.Ip6Address.IP6Byte != NULL) {
+            }
 
-			result_iter = (PDNS_RECORD)calloc(1, sizeof(DNS_RECORD));
-			result_iter->pNext = result;
+            request = (wchar_t *)calloc(250, sizeof(wchar_t));
+            _itow_s(*counter, sub_c, 6, 10);
+            _itow_s(cur_idx, idx_sub, 6, 10);
+            ++(*counter);
 
-			do {
-				result_iter = result_iter->pNext;
-				DnsTunnel* tmp = ((DnsTunnel *)result_iter->Data.AAAA.Ip6Address.IP6Byte);
+            wcscat_s(request, 250, sub_seq);
+            wcscat_s(request, 250, L".");
+            wcscat_s(request, 250, idx_sub);
+            wcscat_s(request, 250, L".");
+            wcscat_s(request, 250, sub_c);
+            wcscat_s(request, 250, L".");
+            wcscat_s(request, 250, domain);
 
-				if (tmp->ff == 0xfe)
-				{
-					xxx[16] = tmp;
-				}
-				else if (tmp->ff == 0xff) {
-					UINT idx = ((UCHAR)(tmp->index_size) >> 4);
-					if (idx < 16) {
-						xxx[idx] = tmp;
-					}
-					else {
-						vdprintf("[PACKET RECEIVE WINDNS] DNS INDEX error");
+            vdprintf("[PACKET RECEIVE WINDNS] SECOND request: %S", request);
+
+            tries--;
+            dns_status = DnsQuery_W(request, DNS_TYPE_AAAA, DNS_QUERY_RETURN_MESSAGE | DNS_QUERY_BYPASS_CACHE | DNS_QUERY_NO_HOSTS_FILE, pSrvList, &result, NULL);
+            vdprintf("[PACKET RECEIVE WINDNS] %d RESULT request: %S - %d   %d", cur_idx, request, dns_status, tries);
+        } while (dns_status != 0 && tries > 0);
+
+        BOOL force_stop = FALSE;
+        
+        for (int i = 0; i < 17; i++) {
+            xxx[i] = NULL;
+        }
+        
+        if (dns_status == 0 && tries > 0) {
+           
+            if (result->Data.AAAA.Ip6Address.IP6Byte != NULL) {
+
+                result_iter = (PDNS_RECORD)calloc(1, sizeof(DNS_RECORD));
+                result_iter->pNext = result;
+
+                do {
+                    result_iter = result_iter->pNext;
+                    DnsTunnel* tmp = ((DnsTunnel *)result_iter->Data.AAAA.Ip6Address.IP6Byte);
+
+                    if (tmp->ff == 0xfe)
+                    {
+                        xxx[16] = tmp;
+                    }
+                    else if (tmp->ff == 0xff) {
+                        UINT idx = ((UCHAR)(tmp->index_size) >> 4);
+                        if (idx < 16) {
+                            xxx[idx] = tmp;
+                        }
+                        else {
+                            vdprintf("[PACKET RECEIVE WINDNS] DNS INDEX error");
+                            force_stop = TRUE;
+                            if (lpParam->result == NULL) {
+                                SAFE_FREE(lpParam->result);
+                            }
+                            lpParam->result = NULL;
+                            lpParam->size = 0;
+                            lpParam->status = ERROR_READ_FAULT;
+                            break;
+                        }
+
+                    }else{
+                        vdprintf("[PACKET RECEIVE WINDNS] DNS FLAG error");
                         force_stop = TRUE;
-						break;
-					}
+                        if (lpParam->result == NULL) {
+                            SAFE_FREE(lpParam->result);
+                        }
+                        lpParam->result = NULL;
+                        lpParam->size = 0;
+                        lpParam->status = ERROR_READ_FAULT;
+                        break;
+                    }
 
-				}else{
-                    vdprintf("[PACKET RECEIVE WINDNS] DNS FLAG error");
-                    force_stop = TRUE;
-					break;
+                } while (result_iter->pNext != NULL);
+            }
+
+            if (force_stop) break;
+
+            UINT i = 0;
+            USHORT current_recieved = 0;
+
+
+            //WaitForSingleObject(lpParam->mutex, INFINITE);
+            
+
+            while (i < 17 && xxx[i] != NULL) {
+                if ((xxx[i]->index_size & 0x0f) < 16) {
+                    //vdprintf("[PACKET RECEIVE WINDNS] %d, reading: %S - %d %S %S", cur_idx, sub_seq, (xxx[i]->index_size & 0x0f), sub_seq, request);
+                    memcpy(lpParam->result + current_recieved, xxx[i]->block.data, (xxx[i]->index_size & 0x0f)); // copy packet
+                    current_recieved += (xxx[i]->index_size & 0x0f);
+                    lpParam->size = current_recieved;
                 }
+                else {
+                    vdprintf("[PACKET RECEIVE WINDNS] INDEX2 overflow error");
+                    force_stop = TRUE; // ERROR
+                    if (lpParam->result == NULL) {
+                        SAFE_FREE(lpParam->result);
+                    }
+                    lpParam->result = NULL;
+                    lpParam->size = 0;
+                    lpParam->status = ERROR_READ_FAULT;
+                    break;
+                }
+                i++;
 
-			} while (result_iter->pNext != NULL);
-		}
-
-
-		UINT i = 0;
-		USHORT current_recieved = 0;
-
-
-		//WaitForSingleObject(lpParam->mutex, INFINITE);
-		lpParam->result = (char *)calloc(238, sizeof(char));
-
-		while (i < 17 && xxx[i] != NULL) {
-			if ((xxx[i]->index_size & 0x0f) < 16) {
-				//vdprintf("[PACKET RECEIVE WINDNS] %d, reading: %S - %d %S %S", cur_idx, sub_seq, (xxx[i]->index_size & 0x0f), sub_seq, request);
-				memcpy(lpParam->result + current_recieved, xxx[i]->block.data, (xxx[i]->index_size & 0x0f)); // copy packet
-				current_recieved += (xxx[i]->index_size & 0x0f);
-				lpParam->size = current_recieved;
-			}
-			else {
-				vdprintf("[PACKET RECEIVE WINDNS] INDEX2 overflow error");
-				force_stop = TRUE; // ERROR
-				if (lpParam->result == NULL) {
-					SAFE_FREE(lpParam->result);
-				}
-				lpParam->result = NULL;
-				lpParam->size = 0;
-				break;
-			}
-			i++;
-
-		}
-		//ReleaseMutex(lpParam->mutex);
-        lpParam->status = 0;
-	}
-	else {
-		vdprintf("[PACKET RECEIVE WINDNS] HEADER NOT FOUND error 2");
-        lpParam->status = dns_status;
-	}
+            }
+            
+            if (force_stop) break;
+            
+            //ReleaseMutex(lpParam->mutex);
+            lpParam->status = 0;
+        }
+        else {
+            vdprintf("[PACKET RECEIVE WINDNS] HEADER NOT FOUND error 2");
+            lpParam->status = dns_status;
+            break;
+        }
+    }
     
 	//WaitForSingleObject(lpParam->mutex, INFINITE);
 	vdprintf("[PACKET RECEIVE WINDNS] %d END %S got %d %S %S", cur_idx, request, lpParam->size, sub_seq, request);
@@ -139,7 +161,7 @@ DWORD WINAPI ThreadProc(DNSThreadParams *lpParam) {
 		SAFE_FREE(request);
 	}
 	//ReleaseMutex(lpParam->mutex);
-	Sleep(500);
+	//Sleep(500);
 	ExitThread(0);
 }
 
@@ -255,59 +277,61 @@ BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter
 		
         
         
-		for (UINT i = 0; i < iterations && break_loop!=TRUE; i++)
+		//for (UINT i = 0; i < iterations && break_loop!=TRUE; i++)
+		//{
+            //UINT i = 0;
+		USHORT created = 0;
+        int y = 0;
+		for (; y < THREADS_MAX && curr_idx < requests; y++)
 		{
-			USHORT created = 0;
-            int y = 0;
-			for (; y < THREADS_MAX && curr_idx < requests; y++)
-			{
-				thread_params[y].mutex = &hMutex;
-				thread_params[y].pSrvList = pip4;
-				thread_params[y].domain = domain;
-				thread_params[y].subd = sub_seq_orig;
-				thread_params[y].result = NULL;
-				thread_params[y].size = 0;
-                thread_params[y].status = 1;
-				thread_params[y].index = curr_idx;
-				
-				vdprintf("[PACKET RECEIVE WINDNS] START %d %S %S", curr_idx, thread_params[y].domain, thread_params[y].subd);
+			thread_params[y].mutex = &hMutex;
+			thread_params[y].pSrvList = pip4;
+			thread_params[y].domain = domain;
+			thread_params[y].subd = sub_seq_orig;
+			thread_params[y].result = NULL;
+			thread_params[y].size = 0;
+            thread_params[y].status = 1;
+			thread_params[y].index = curr_idx;
+            thread_params[y].index_stop = ((curr_idx + xxx) < requests ) ? (curr_idx + xxx) : requests;
+			
+            vdprintf("[PACKET RECEIVE WINDNS] START %d .. %d %S %S", curr_idx, thread_params[y].index_stop, thread_params[y].domain, thread_params[y].subd);
                
-				hThreads[y] = CreateThread(NULL, 0, &ThreadProc, &thread_params[y], 0, NULL);
+			hThreads[y] = CreateThread(NULL, 0, &ThreadProc, &thread_params[y], 0, NULL);
 				
-                if (NULL == hThreads[y]) {
-					vdprintf("Failed to create thread.\r\n");
-				}
-                
-                created++;
-                curr_idx++;
+            if (NULL == hThreads[y]) {
+                vdprintf("Failed to create thread.\r\n");
 			}
-            
-            
-			WaitForMultipleObjects(y, hThreads, TRUE, INFINITE);
-
-
-			for (int y = 0; y < THREADS_MAX && y < created && break_loop!=TRUE; y++)
-			{
-				vdprintf("[PACKET RECEIVE WINDNS] FINISH got %S, %d [%d]", thread_params[y].subd, thread_params[y].size,y);
-                if (thread_params[y].status == 0 && thread_params[y].size > 0){
-                    
-                    memcpy(recieve->packet + current_recieved, thread_params[y].result, thread_params[y].size);
-                    current_recieved += thread_params[y].size;
-                    
-                } else {
-                    dns_status = thread_params[y].status;
-                    break_loop = TRUE;
-                }
                 
-                //CLEAN 
-                thread_params[y].domain = NULL;
-                thread_params[y].subd = NULL;
-                thread_params[y].status = 1;
-                if (thread_params[y].result != NULL)
-                    SAFE_FREE(thread_params[y].result)
-                thread_params[y].size = 0;
-			}
+            created++;
+            curr_idx += thread_params[y].index_stop;
 		}
+            
+            
+		WaitForMultipleObjects(y, hThreads, TRUE, INFINITE);
+
+
+		for (int y = 0; y < THREADS_MAX && y < created && break_loop!=TRUE; y++)
+		{
+			vdprintf("[PACKET RECEIVE WINDNS] FINISH got %S, %d [%d]", thread_params[y].subd, thread_params[y].size,y);
+            if (thread_params[y].status == 0 && thread_params[y].size > 0){
+                    
+                memcpy(recieve->packet + current_recieved, thread_params[y].result, thread_params[y].size);
+                current_recieved += thread_params[y].size;
+                    
+            } else {
+                dns_status = thread_params[y].status;
+                break_loop = TRUE;
+            }
+                
+            //CLEAN 
+            thread_params[y].domain = NULL;
+            thread_params[y].subd = NULL;
+            thread_params[y].status = 1;
+            if (thread_params[y].result != NULL)
+                SAFE_FREE(thread_params[y].result)
+            thread_params[y].size = 0;
+		}
+		//}
     }
     
     SAFE_FREE(sub_seq_orig)
