@@ -4,7 +4,7 @@
 #define MAX_DNS_NAME_SIZE 253
 #define MAX_DNS_SUBNAME_SIZE 62
 
-#define THREADS_MAX 50
+#define THREADS_MAX 5
 
 #include <ws2tcpip.h>
 #include <windns.h>
