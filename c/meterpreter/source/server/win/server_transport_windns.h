@@ -50,7 +50,7 @@ typedef struct _DNSThreadParams
 	wchar_t *subd;
 	wchar_t *domain;
 	PIP4_ARRAY pSrvList;
-	USHORT size;
+	UINT size;
     UINT status;
 	UCHAR *result;
 } DNSThreadParams;

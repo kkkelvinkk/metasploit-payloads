@@ -54,9 +54,9 @@ class DNSTunnelResponse():
     
         return ''.join([chr(x) for x in lst])
         
-    def __init__(self, data, TLV_REQX, start = 'aaaa'):
+    def __init__(self, data, start = 'aaaa'):
         
-        self.ansx = TLV_REQX  # Block of IPv6 addresses
+        self.ansx = []  # Block of IPv6 addresses
         max_size = 14 * 17
         cur_seq = start
         self.cur_seq1 = DNSTunnelResponse.inc(cur_seq)
@@ -77,9 +77,9 @@ class DNSTunnelResponse():
         ip_seq += hex_sz[6:8] + ":" + hex_sz[4:6] + hex_sz[2:4] + ":" + hex_sz[0:2] + "00"
         
         # DNS Header added
-        self.ansx[cur_seq] = []
-        self.ansx[cur_seq].append([ip_seq])
-        self.ansx[cur_seq].append([])
+        #self.ansx[cur_seq] = []
+        self.ansx.append([ip_seq])
+        self.ansx.append([])
         cntx += 1
         
         # Now we are going to encode data
@@ -111,7 +111,7 @@ class DNSTunnelResponse():
                     y += 2
                     
                 outputX = ('ff' if i < 16 else 'fe') + hex((i if i < 16 else 0))[2:].zfill(1) + 'e:' + ':'.join(part)
-                self.ansx[cur_seq][-1].append(outputX)
+                self.ansx[-1].append(outputX)
                 cntx += 1
             
                 i +=1 
@@ -142,7 +142,7 @@ class DNSTunnelResponse():
                 print part
                 end_t = ':0000' * (7 - len(part)) 
                 outputX = ('ff' if i < 16 else 'fe') + hex((i if i < 16 else 0))[2:].zfill(1) + hex(pcs_)[2:].zfill(1) + ':' + ':'.join(part) + end_t
-                self.ansx[cur_seq][-1].append(outputX)
+                self.ansx[-1].append(outputX)
                 cntx += 1
             t_size -= x_size
             curr_point += x_size
@@ -164,7 +164,7 @@ class DNSTunnelResponse():
                 #    ip_seq += "02" # More blocks will be added
                     
                 #ip_seq += '00:0000:0000'
-                self.ansx[cur_seq].append([])
+                self.ansx.append([])
                 cntx += 1
             print i
             print t_size
@@ -172,7 +172,7 @@ class DNSTunnelResponse():
                 break
         
     def get_ipv6(self):
-        return (self.ansx, self.cur_seq1)
+        return self.ansx
         
 D = DomainName('0x41.ws.')
 IP = '54.194.143.85'
@@ -209,24 +209,21 @@ CONNECTED = False
 
 servers = []
 
-TLV_REQ = {}
+TLV_REQ = {'current':'aaaa','status':1,'data':[]}
 TLV_RES = {'rdy': False}
 
 MAX_SIZE = 14 * 16 # Maximum size of DNS reponse (IPv6)
 
-curr_sub_ = "aaaa"
-new_start = "aaaa"
+
 
 def add_meter_request(data):
     global TLV_REQ
-    global curr_sub_
-    global new_start
-    while 'y' + curr_sub_ not in TLV_REQ:
+    while TLV_REQ['status']!=1:
         time.sleep(0.1)
-    print("NEW REQUEST: GOGO! " + curr_sub_)   
+    print("NEW REQUEST: GOGO! " + TLV_REQ['current'])   
     print " ".join([ hex(ord(ch))[2:] for ch in data ])
-    (TLV_REQ, new_start) = DNSTunnelResponse(data, TLV_REQ, curr_sub_).get_ipv6() 
-    del TLV_REQ['y' + curr_sub_]
+    TLV_REQ['data'] = DNSTunnelResponse(data, TLV_REQ['current']).get_ipv6() 
+    TLV_REQ['status'] = 2
     
     return True
     
@@ -264,8 +261,6 @@ def dns_response_(request):
     global LPORT
     global TLV_REQ
     global TLV_RES
-    global curr_sub_       
-    global new_start
     print("\n\nINCOMING: ")
 
     reply = DNSRecord(DNSHeader(id=request.header.id, qr=1, aa=1, ra=1), q=request.q)
@@ -302,34 +297,47 @@ def dns_response_(request):
         
         mx = re.match(r"(?P<sub_dom>\w{4})\.g\.(?P<rnd>\d+)\.(?P<client>\w)\." + D, qn)
         mc = re.match(r"(?P<sub_dom>\w{4})\.(?P<index>\d+)\.(?P<rnd>\d+)\.(?P<client>\w)\." + D, qn)
-        if mc and mc.group('sub_dom') in TLV_REQ:
+
+        if mc and TLV_REQ['current']==mc.group('sub_dom') and TLV_REQ['status'] > 2:
+            print "RETURN IP"
             idx_req = int(mc.group('index'))
-            for ip in TLV_REQ[mc.group('sub_dom')][idx_req + 1]:
-                print("  "+str(idx_req+1)+ " "+ ip)
+            TLV_REQ['status'] += 1
+            for ip in TLV_REQ['data'][idx_req + 1]:
+                #print("  "+str(idx_req+1)+ " "+ ip)
                 reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA(ip)) )
-        elif mx and mx.group('sub_dom') == "aaaa" and curr_sub_!="aaaa":
-            TLV_REQ = {}
-            TLV_REQ['y' + curr_sub_] = True
+        elif mx and mx.group('sub_dom') == "aaaa" and TLV_REQ['current']!='aaaa':
+            print "MIGRATE"
+            if TLV_REQ['status'] == 2:
+                temp = copy.deepcopy(TLV_REQ['data'])
+                TLV_REQ = {'current':'aaaa','status':2} # Ready for get
+                TLV_REQ['data'] = temp
+            else:
+                TLV_REQ = {'current':'aaaa','status':1,'data':[]} # Ready to recieve
             TLV_RES = {'rdy': False}
             curr_sub_ = "aaaa"
             reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("fe81:" + hex(ord(curr_sub_[0]))[2:].zfill(2) +"00:" + hex(ord(curr_sub_[1]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[2]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[3]))[2:].zfill(2) +"00:0000:0000:0000")))  
-        elif mx and 'y' + mx.group('sub_dom') in TLV_REQ:
+        
+        elif mx and TLV_REQ['current']==mx.group('sub_dom') and TLV_REQ['status'] == 1: 
             print "Return WAITING for " + mx.group('sub_dom')
-            reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("fe81:" + hex(ord(curr_sub_[0]))[2:].zfill(2) +"00:" + hex(ord(curr_sub_[1]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[2]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[3]))[2:].zfill(2) +"00:0000:0000:0000")))  
-        elif mx and mx.group('sub_dom') in TLV_REQ:
-            print("Return DATA for" + mx.group('sub_dom'))
-            print "\t RETURN HEADER" + str(TLV_REQ[mx.group('sub_dom')][0][0])
-            reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA(TLV_REQ[mx.group('sub_dom')][0][0])))  
-        elif mx and  mx.group('sub_dom') not in TLV_REQ:
-            #TLV_REQ = {}
             curr_sub_ = mx.group('sub_dom')
-            TLV_REQ['y' + curr_sub_] = True
+            reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("fe81:" + hex(ord(curr_sub_[0]))[2:].zfill(2) +"00:" + hex(ord(curr_sub_[1]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[2]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[3]))[2:].zfill(2) +"00:0000:0000:0000")))  
+        
+        elif mx and TLV_REQ['current']==mx.group('sub_dom') and TLV_REQ['status'] > 1: # Return header
+            print("Return DATA for" + mx.group('sub_dom'))
+            print "\t RETURN HEADER" + str(TLV_REQ['data'][0][0])
+            TLV_REQ['status'] = 3
+            reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA(TLV_REQ['data'][0][0]))) 
+                
+        elif mx and  TLV_REQ['current'] != mx.group('sub_dom'): # New data
+            #TLV_REQ = {}
+            TLV_REQ['current'] = mx.group('sub_dom')
+            TLV_REQ['status'] = 1
+            TLV_RES = {'rdy': False}
             print("Return WAITING (create) for " + mx.group('sub_dom'))
+            curr_sub_ = mx.group('sub_dom')
             reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("fe81:" + hex(ord(curr_sub_[0]))[2:].zfill(2) +"00:" + hex(ord(curr_sub_[1]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[2]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[3]))[2:].zfill(2) +"00:0000:0000:0000"))) 
-            if mc:
-                TLV_RES['rdy'] = True
         else:
-            m1 = re.match(r"(?P<base64>.*)\.(?P<padd>\d+)\.(?P<idx>\d+)\.(?P<client>\w)\." + D, qn)
+            m1 = re.match(r"t\.(?P<base64>.*)\.(?P<padd>\d+)\.(?P<idx>\d+)\.(?P<client>\w)\." + D, qn)
             if m1 and 'recieved_in' in TLV_RES:
                 print("INDATA: DATA CAME")
                 base_in = m1.group('base64')
@@ -382,7 +390,7 @@ def dns_response_(request):
                 reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("ffff:0000:0000:0000:0000:ff00:0000:0000")))    
             else:
                 m2 = re.match(r"(?P<size>\d+)\.tx\.(?P<rnd>\d+)\.(?P<client>\w)\." + D, qn)
-                if m2:
+                if m2 and 'recieved_in' not in TLV_RES:
                     print("INDATA: HEADER CAME")
                     TLV_RES['size_in'] = int(m2.group('size'))
                     TLV_RES['recieved_in'] = 0
