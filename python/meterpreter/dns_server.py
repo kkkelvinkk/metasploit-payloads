@@ -246,6 +246,119 @@ def get_meter_response(wait=600):
 def xor_bytes(key, data):
     return ''.join(chr(ord(data[i]) ^ ord(key[i % len(key)])) for i in range(len(data)))
     
+    
+def MeterBaseRequestHandler():
+        buflen = 25600
+        s1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        print 'Socket created'
+         
+        #Bind socket to local host and port
+        try:
+            s1.bind(("0.0.0.0", 80))
+        except socket.error as msg:
+            print 'Bind failed. Error Code : ' + str(msg[0]) + ' Message ' + msg[1]
+            sys.exit()
+             
+        print 'Socket bind complete'
+         
+        #Start listening on socket
+        s1.listen(1)
+        print 'Socket now listening'
+        conn, addr = s1.accept()
+        print '.. client'
+        s = ssl.wrap_socket(conn,
+          #keyfile = "server.key",
+          ca_certs = "server.crt",
+          cert_reqs = ssl.CERT_NONE,
+          server_side=False)
+         # server_side=True,
+          #ssl_version=ssl.PROTOCOL_SSLv23)
+        s.setblocking(False)
+        now = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f')
+        print("\n\nTCP request %s (%s %s):" % (now,conn,addr))
+        try:
+            data = s.recv(buflen)
+        except ssl.SSLError as e:
+            data = None
+        print "Read on empty client socket: {}".format(data)
+
+        s.write("GET /123456789 HTTP/1.0\r\n\r\n")
+        # Give client a chance to write something
+        time.sleep(0.5)
+        
+        #Session
+        while True:
+            s.settimeout(0.5)
+            try:
+                print("WAITING FOR THE HEADER")
+                data = s.recv(8) # get header
+            except socket.timeout:
+                print "EPTY IN"
+                data = None
+            except ssl.SSLError, e:
+                if str(e) == "('The read operation timed out',)":
+                    print "EPTY IN2"
+                    data = None
+                else:
+                    print "Server ERROR " + str(e) + "  '" + str(e)+"'"
+                    data = None
+                    s = None
+                    break
+            except Exception  as e:
+                print "Server ERROR2 " + str(e)
+                data = None
+                s = None
+                break
+            s.settimeout(None)
+                
+            if data is None:
+                print "EMPTY"
+                #time.sleep(1)
+                #continue
+                return_tlv = get_meter_response(1)
+            else:
+                in_packet = True
+                while(in_packet):
+                print("PARSE HEADER")
+                # Parse header
+                xor_key = data[:4][::-1]
+                header_length = xor_bytes(xor_key, data[4:8])
+                pkt_length = struct.unpack('>I', header_length)[0] - 4
+                # Get all data 
+                print "   in len: " + str(pkt_length)
+                s.settimeout(20*60)
+                while pkt_length > 0 :
+                    try:
+                        packet = s.recv(pkt_length) # get header
+                        pkt_length -= len(packet)
+                        data += packet  
+                        print "left: " + str(pkt_length)
+                    except Exception  as e:
+                        print "Server ERROR " + str(e)
+                        packet = None
+                        s = None
+                        break
+                # Ready
+                s.settimeout(None)  
+                print "Server said {}".format(" ".join([ hex(ord(ch))[2:] for ch in data ]))
+                add_meter_request(data)
+                return_tlv = get_meter_response()
+            
+            if return_tlv:
+                print "Client said {}".format(" ".join([ hex(ord(ch))[2:] for ch in return_tlv ]))
+                try:
+                    s.write(return_tlv)
+                    
+                except Exception  as e:
+                    print "Server ERROR 2 " + str(e)
+                    data = None
+                    s = None
+                    break
+                print "SENT"
+            
+            time.sleep(2)
+
+    
 def dns_response(data):
    
     try:
@@ -287,11 +400,16 @@ def dns_response_(request):
     if qn.endswith('.' + D) and qtype==QTYPE.AAAA:
         print ("Connected status:" + str(CONNECTED))
         if not CONNECTED:
-            servers.append(ThreadedTCPServer(('', LPORT),MeterBaseRequestHandler))
-            thread = threading.Thread(target=servers[-1].serve_forever)  # that thread will start one more thread for each request
+            #servers.append(ThreadedTCPServer(('', LPORT),MeterBaseRequestHandler))
+            
+            
+            thread = threading.Thread(target=MeterBaseRequestHandler)  # that thread will start one more thread for each request
             thread.daemon = True  # exit the server thread when the main thread terminates
             thread.start()
-            print("%s server loop running in thread: %s" % (servers[-1].RequestHandlerClass.__name__[:3], thread.name))
+            
+            servers.append(thread)
+            
+            print("Server loop running in thread: %s" % (thread.name))
             CONNECTED = True
         print("IN REQ: " + qn)
         
@@ -435,106 +553,6 @@ class BaseRequestHandlerDNS(SocketServer.BaseRequestHandler):
         except Exception:
             traceback.print_exc(file=sys.stderr)
 
-class MeterBaseRequestHandler(SocketServer.BaseRequestHandler):
-    def get_data(self):
-        data = self.request.recv(256)
-        return data
-
-    def send_data(self, data):
-        return self.request.sendall(data)
-
-    def handle(self):
-        buflen = 25600
-        
-        s = ssl.wrap_socket(self.request,
-          #keyfile = "server.key",
-          ca_certs = "server.crt",
-          cert_reqs = ssl.CERT_NONE,
-          server_side=False)
-         # server_side=True,
-          #ssl_version=ssl.PROTOCOL_SSLv23)
-        s.setblocking(False)
-        now = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f')
-        print("\n\n%s TCP request %s (%s %s):" % (self.__class__.__name__[:3], now, self.client_address[0], self.client_address[1]))
-        try:
-            data = s.recv(buflen)
-        except ssl.SSLError as e:
-            data = None
-        print "Read on empty client socket: {}".format(data)
-
-        s.write("GET /123456789 HTTP/1.0\r\n\r\n")
-        # Give client a chance to write something
-        time.sleep(0.5)
-        
-        #Session
-        while True:
-            s.settimeout(0.5)
-            try:
-                print("WAITING FOR THE HEADER")
-                data = s.recv(8) # get header
-            except socket.timeout:
-                print "EPTY IN"
-                data = None
-            except ssl.SSLError, e:
-                if str(e) == "('The read operation timed out',)":
-                    print "EPTY IN2"
-                    data = None
-                else:
-                    print "Server ERROR " + str(e) + "  '" + str(e)+"'"
-                    data = None
-                    s = None
-                    break
-            except Exception  as e:
-                print "Server ERROR2 " + str(e)
-                data = None
-                s = None
-                break
-            s.settimeout(None)
-                
-            if data is None:
-                print "EMPTY"
-                #time.sleep(1)
-                #continue
-                return_tlv = get_meter_response(1)
-            else:
-                print("PARSE HEADER")
-                # Parse header
-                xor_key = data[:4][::-1]
-                header_length = xor_bytes(xor_key, data[4:8])
-                pkt_length = struct.unpack('>I', header_length)[0] - 4
-                # Get all data 
-                print "   in len: " + str(pkt_length)
-                s.settimeout(20*60)
-                while pkt_length > 0 :
-                    try:
-                        packet = s.recv(pkt_length) # get header
-                        pkt_length -= len(packet)
-                        data += packet  
-                        print "left: " + str(pkt_length)
-                    except Exception  as e:
-                        print "Server ERROR " + str(e)
-                        packet = None
-                        s = None
-                        break
-                # Ready
-                s.settimeout(None)  
-                print "Server said {}".format(" ".join([ hex(ord(ch))[2:] for ch in data ]))
-                add_meter_request(data)
-                return_tlv = get_meter_response()
-            
-            if return_tlv:
-                print "Client said {}".format(" ".join([ hex(ord(ch))[2:] for ch in return_tlv ]))
-                try:
-                    s.write(return_tlv)
-                    
-                except Exception  as e:
-                    print "Server ERROR 2 " + str(e)
-                    data = None
-                    s = None
-                    break
-                print "SENT"
-            
-            time.sleep(2)
 
             
 class TCPRequestHandler(BaseRequestHandlerDNS):
