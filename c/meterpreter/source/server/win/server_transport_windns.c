@@ -1140,10 +1140,12 @@ void transport_write_dns_config(Transport* transport, MetsrvTransportDns* config
     {
         wcsncpy(config->ns_server, ctx->ns_server, NS_NAME_SIZE);
     }
+    /*
     if (ctx->domain)
     {
-        wcsncpy(config->ns_server, ctx->domain, DOMAIN_NAME_SIZE);
+        wcsncpy(config->, ctx->domain, DOMAIN_NAME_SIZE);
     }
+    */
     //config->type = ctx->type;
     
 }
@@ -1188,7 +1190,7 @@ Transport* transport_create_dns(MetsrvTransportDns* config)
     
     ctx->ns_server = _wcsdup(config->ns_server);
     //ctx->type = config->type;
-    ctx->counter = 0;
+    ctx->counter = 0; //TODO: GET COUNTER FROM THE CONFIG
     ctx->pip4 = NULL;
         
     transport->packet_transmit = packet_transmit_via_dns;

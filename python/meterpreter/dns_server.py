@@ -2,19 +2,18 @@
 # coding=utf-8
 
 import argparse
-import datetime
 import sys
 import time
 import threading
-import traceback
 import SocketServer
 import struct
 import re
 import ssl
 import Queue
-import copy
 import base64
 import logging
+import socket
+import select
 
 try:
     from dnslib import *
@@ -23,7 +22,10 @@ except ImportError:
     sys.exit(2)
 
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)-24s %(levelname)-8s %(message)s"
+)
 logger = logging.getLogger("dns_server")
 
 
@@ -176,9 +178,6 @@ class IPv6Encoder():
         return ["ffff:0000:0000:0000:0000:f000:0000:0000"]
 
 
-LPORT = 4444
-CONNECTED = False
-
 servers = []
 _clients = {}
 dns_server = None
@@ -204,7 +203,7 @@ class Client(object):
         self.state = self.INITIAL
         self.received_data_size = 0
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.logger.setLevel(logging.DEBUG)
+        #self.logger.setLevel(logging.DEBUG)
         self.received_data = ""
         self.last_received_index = -1
         self.sub_domain = "aaaa"
@@ -213,35 +212,38 @@ class Client(object):
         self.send_indexes = set()
         self.server_queue = Queue.Queue()
         self.client_queue = Queue.Queue()
+        self.server = None
 
     def _setup_receive(self, exp_data_size, padding):
         self.state = self.INCOMING_DATA
         self.received_data_size = exp_data_size
-        self.padding = padding
         self.received_data = ""
         self.last_received_index = -1
+        self.padding = padding
 
     def _initial_state(self):
         self.state = self.INITIAL
         self.received_data = ""
-        self.padding = 0
         self.last_received_index = -1
         self.received_data_size = 0
+        self.padding = 0
+
+    def set_server(self, server):
+        self.server = server
 
     def incoming_data_header(self, data_size, padding):
-    
         if self.received_data_size == data_size and self.state == self.INCOMING_DATA:
-            self.logger.info("Dublicated header request: waiting %d bytes of data with padding %d", data_size, padding)
+            self.logger.info("Duplicated header request: waiting %d bytes of data with padding %d", data_size, padding)
             return IPv6Encoder.encode_ready_receive()
         elif self.state == self.INCOMING_DATA:
             self.logger.error("Bad request. Client in the receiving data state")
             return None
-        self.logger.info("Data header: waiting %d bytes of data with padding %d", data_size, padding)
+        self.logger.info("Data header: waiting %d bytes of data", data_size)
         self._setup_receive(data_size, padding)
         return IPv6Encoder.encode_ready_receive()
 
     def incoming_data(self, data, index, counter):
-        self.logger.debug("Data %s, padding %d, index %d", data, index, counter)
+        self.logger.debug("Data %s, index %d", data, index)
         if self.state != self.INCOMING_DATA:
             self.logger.error("Bad state(%d) for this action. Send finish.", self.state)
             return IPv6Encoder.encode_finish_send()
@@ -253,7 +255,7 @@ class Client(object):
             return IPv6Encoder.encode_finish_send()
 
         if self.last_received_index >= index:
-            self.logger.info("Dublicated packet.")
+            self.logger.info("Duplicated packet.")
             return IPv6Encoder.encode_send_more_data()
 
         if len(self.received_data) + data_size > self.received_data_size:
@@ -266,10 +268,12 @@ class Client(object):
         if len(self.received_data) == self.received_data_size:
             self.logger.info("All expected data is received")
             try:
-                packet = base64.b32decode((self.received_data + "=" * self.padding).upper())
+                packet = base64.b32decode(self.received_data + "=" * self.padding, True)
                 self.logger.info("Put decoded data to the server queue")
                 self.server_queue.put(packet)
                 self._initial_state()
+                if self.server:
+                    self.server.notify_data()
             except Exception:
                 self.logger.error("Error during decode received data", exc_info=True)
                 self._initial_state()
@@ -296,7 +300,7 @@ class Client(object):
                 sub_domain = next_sub
                 self.enc_send_data = IPv6Encoder.encode_data(self.send_data)
                 self.send_indexes = set()
-                self.send_data = ""
+                #self.send_data = ""
             else:
                 self.logger.info("No data for client.")
             self.logger.info("Send data header to client with domain %s and size %d", sub_domain, data_size)
@@ -305,6 +309,9 @@ class Client(object):
             self.logger.info("Subdomain is different %s(request) - %s(client)", sub_domain, self.sub_domain)
             if sub_domain == "aaaa":
                 self.logger.info("MIGRATE. Not DONE")
+                self.sub_domain = sub_domain
+                self.send_data = ""
+                self.enc_send_data = ""
             else:
                 self.sub_domain = sub_domain
                 self.send_data = ""
@@ -336,6 +343,9 @@ class Client(object):
         except Queue.Empty:
             pass
         return data
+
+    def server_has_data(self):
+        return not self.server_queue.empty()
 
 
 class Request(object):
@@ -386,13 +396,13 @@ class GetDataRequest(Request):
 
 
 class IncomingDataRequest(Request):
-    EXPR = re.compile(r"t\.(?P<base32>.*)\.(?P<idx>\d+)\.(?P<cnt>\d+)\.(?P<client>\w)")
+    EXPR = re.compile(r"t\.(?P<base64>.*)\.(?P<idx>\d+)\.(?P<cnt>\d+)\.(?P<client>\w)")
 
     @classmethod
     def _handle_client(cls, client, match_data):
-        enc_data = match_data.group('base32')
-        index = int(match_data.group('idx'))
+        enc_data = match_data.group('base64')
         counter = int(match_data.group('cnt'))
+        index = int(match_data.group('idx'))
         enc_data = re.sub(r"\.", "", enc_data)
         #enc_data = re.sub(r"\-", "+", enc_data)
         #enc_data = re.sub(r"\_", "/", enc_data)
@@ -413,7 +423,7 @@ class AAAARequestHandler(object):
     def __init__(self, domain):
         self.domain = domain
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.logger.setLevel(logging.DEBUG)
+        #self.logger.setLevel(logging.DEBUG)
         self.request_handler = [
             IncomingDataHeaderRequest,
             IncomingDataRequest,
@@ -428,14 +438,14 @@ class AAAARequestHandler(object):
             self.logger.error("Bad request: can't find domain %s in %s", self.domain, qname)
             return
         sub_domain = qname[:i]
-        self.logger.debug("requested subdomain name is %s", qname)
+        self.logger.info("requested subdomain name is %s", sub_domain)
         is_handled = False
         for handler in self.request_handler:
             answer = handler.handle(sub_domain)
             if answer is not None:
                 for rr in answer:
                     self.logger.debug("Add resource record to the reply %s", rr)
-                    reply.add_answer(RR(rname=qname, rtype=QTYPE.AAAA, rclass=1, ttl=TTL,
+                    reply.add_answer(RR(rname=qname, rtype=QTYPE.AAAA, rclass=1, ttl=1,
                                         rdata=AAAA(rr)))
                 is_handled = True
                 break
@@ -476,10 +486,11 @@ class DnsServer(object):
 
     def _process_ns_request(self, reply, qname):
         for server in self.ns_servers:
-            reply.add_answer(RR(rname=qname, rtype=QTYPE.NS, rclass=1, ttl=TTL, rdata=server))
+            reply.add_answer(RR(rname=qname, rtype=QTYPE.NS, rclass=1, ttl=1, rdata=server))
 
     def _process_a_request(self, reply, qname):
-        reply.add_answer(RR(rname=qname, rtype=QTYPE.A, rclass=1, ttl=TTL, rdata=A(self.ipv4)))
+        self.logger.info("Send answer for A request - %s", self.ipv4)
+        reply.add_answer(RR(rname=qname, rtype=QTYPE.A, rclass=1, ttl=1, rdata=A(self.ipv4)))
 
     def _process_aaaa_request(self, reply, qname):
         if self.aaaa_handler is not None:
@@ -507,8 +518,7 @@ class BaseRequestHandlerDNS(SocketServer.BaseRequestHandler):
         raise NotImplementedError
 
     def handle(self):
-        now = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f')
-        logger.info("%s DNS request %s (%s %s):", self.__class__.__name__[:3], now, self.client_address[0],
+        logger.info("DNS request %s (%s %s):", self.__class__.__name__[:3], self.client_address[0],
                     self.client_address[1])
         try:
             data = self.get_data()
@@ -520,110 +530,214 @@ class BaseRequestHandlerDNS(SocketServer.BaseRequestHandler):
             logger.error("Exception", exc_info=True)
 
 
-class MeterBaseRequestHandler(SocketServer.BaseRequestHandler):
-    def get_data(self):
-        data = self.request.recv(256)
-        return data
+class ServerClient(object):
+    HEADER_SIZE = 8
+    BUFFER_SIZE = 2048
 
-    def send_data(self, data):
-        return self.request.sendall(data)
+    INITIAL = 1
+    RECEIVING_DATA = 2
 
-    def handle(self):
-        buflen = 25600
+    LOGGER = logging.getLogger("ServerClient")
 
-        s = ssl.wrap_socket(self.request,
+    def __init__(self, sock, server):
+        self.sock = sock
+        self.ssl_socket = None
+        self.data = ""
+        self.need_read_size = 0
+        self.state = ServerClient.INITIAL
+        self.server = server
+        self.client_id = 'a'
+        self._setup_ssl()
+
+    def get_socket(self):
+        return self.ssl_socket if self.ssl_socket else self.sock
+
+    def _setup_ssl(self):
+        if self.ssl_socket is None:
+            ServerClient.LOGGER.info("Create ssl socket")
+            try:
+                self.sock.setblocking(True)
+                self.ssl_socket = ssl.wrap_socket(self.sock,
                             # keyfile = "server.key",
                             # ca_certs="server.crt",
                             cert_reqs=ssl.CERT_NONE,
                             server_side=False)
-        # server_side=True,
-        # ssl_version=ssl.PROTOCOL_SSLv23)
-        s.setblocking(False)
-        now = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f')
-        logger.info("%s TCP request %s (%s %s):", self.__class__.__name__[:3], now, self.client_address[0],
-                    self.client_address[1])
+                self.ssl_socket.setblocking(False)
+                self.ssl_socket.write("GET /123456789 HTTP/1.0\r\n\r\n")
+            except:
+                ServerClient.LOGGER.error("Can't create ssl context:", exc_info=True)
+                self.server.remove_me(self)
+
+    def _read_data(self, size):
+        data = None
         try:
-            data = s.recv(buflen)
-        except ssl.SSLError as e:
-            data = None
-        logger.debug("Read on empty client socket: {}".format(data))
+            data = self.ssl_socket.recv(size)
+            if not data:
+                ServerClient.LOGGER.info("Connection closed by client")
+                #self.ssl_socket.unwrap()
+                self.ssl_socket = None
+                self._setup_ssl()
+                return None
+            return data
+        except ssl.SSLWantReadError:
+            ServerClient.LOGGER.info("Not all data is prepared for decipher.Reread data later.")
+            #add small sleep
+            time.sleep(0.1)
+            return None
+        except:
+            ServerClient.LOGGER.error("Exception during read", exc_info=True)
+            return None
 
-        s.write("GET /123456789 HTTP/1.0\r\n\r\n")
-        # Give client a chance to write something
-        time.sleep(0.5)
+    def need_read(self):
+        if self.state == ServerClient.INITIAL:
+            # read header
+            header = self._read_data(ServerClient.HEADER_SIZE)
 
-        # Session
-        while True:
-            s.settimeout(0.5)
-            try:
-                logger.info("WAITING FOR THE HEADER")
-                data = s.recv(8)  # get header
-            except socket.timeout:
-                logger.info("EPTY IN")
-                data = None
-            except ssl.SSLError, e:
-                if str(e) == "('The read operation timed out',)":
-                    logger.info("EPTY IN2")
-                    data = None
-                else:
-                    logger.error("Server ERROR %s", e, exc_info=True)
-                    data = None
-                    s = None
-                    break
-            except Exception  as e:
-                logger.error("Server ERROR2 %s", e)
-                data = None
-                s = None
-                break
-            s.settimeout(None)
+            if header is None:
+                return
 
-            cl = get_client_by_id('a')
+            if len(header) != ServerClient.HEADER_SIZE:
+                ServerClient.LOGGER.error("Can't read full header)")
+                return
+            ServerClient.LOGGER.debug("PARSE HEADER")
+            xor_key = header[:4][::-1]
+            header_length = xor_bytes(xor_key, header[4:8])
+            pkt_length = struct.unpack('>I', header_length)[0] - 4
+            ServerClient.LOGGER.info("incoming packet - need to read %d data", pkt_length)
+            self.need_read_size = pkt_length
+            self.data = header
+
+            # try read immediately
+            data = self._read_data(self.need_read_size)
             if data is None:
-                logger.info("EMPTY")
-                # time.sleep(1)
-                # continue
-                return_tlv = cl.server_get_data(1)
-                logger.info("Got data length %d", len(return_tlv) if return_tlv else 0)
+                return
+            self.data += data
+            self.need_read_size -= len(data)
+
+            if self.need_read_size == 0:
+                self.send_to_client(self.client_id)
             else:
-                logger.info("PARSE HEADER")
-                # Parse header
-                xor_key = data[:4][::-1]
-                header_length = xor_bytes(xor_key, data[4:8])
-                pkt_length = struct.unpack('>I', header_length)[0] - 4
-                # Get all data
-                logger.info("in len: %d", pkt_length)
-                s.settimeout(20 * 60)
-                while pkt_length > 0:
-                    try:
-                        packet = s.recv(pkt_length)  # get header
-                        pkt_length -= len(packet)
-                        data += packet
-                        logger.info("left: %d", pkt_length)
-                    except Exception  as e:
-                        logger.error("SERVER ERROR %s", e, exc_info=True)
-                        packet = None
-                        s = None
-                        break
-                # Ready
-                s.settimeout(None)
-                logger.debug("Server said {}".format(" ".join([hex(ord(ch))[2:] for ch in data])))
-                cl.server_put_data(data)
-                return_tlv = cl.server_get_data()
-                logger.info("Got data length %d", len(return_tlv) if return_tlv else 0)
+                self.state = ServerClient.RECEIVING_DATA
+        else:
+            data = self._read_data(self.need_read_size)
+            if data is None:
+                return
+            self.data += data
+            self.need_read_size -= len(data)
 
-            if return_tlv:
-                logger.debug("Client said {}".format(" ".join([hex(ord(ch))[2:] for ch in return_tlv])))
-                try:
-                    logger.info("Send data to server")
-                    s.write(return_tlv)
-                except Exception  as e:
-                    logger.error("Server ERROR 2 %s", e, exc_info=True)
-                    data = None
-                    s = None
-                    break
-                logger.info("SENT")
+            if self.need_read_size == 0:
+                self.send_to_client(self.client_id)
 
-            time.sleep(2)
+    def want_write(self):
+        client = get_client_by_id(self.client_id)
+        if client:
+            return client.server_has_data()
+        return False
+
+    def notify_data(self):
+        self.server.poll()
+
+    def send_to_client(self, client_id):
+        ServerClient.LOGGER.info("All data from server is read. Sending to client.")
+        client = get_client_by_id(client_id)
+        if client:
+            client.server_put_data(self.data)
+        else:
+            ServerClient.LOGGER.error("Client with id %s is not found.Dropping data", client_id)
+        self.data = ""
+        self.need_read_size = 0
+        self.state = ServerClient.INITIAL
+
+    def write_data(self):
+        client = get_client_by_id(self.client_id)
+        if client:
+            data = client.server_get_data()
+            if data:
+                ServerClient.LOGGER.info("Send data to server - %d bytes", len(data))
+                self.ssl_socket.write(data)
+
+    def close(self):
+        self.ssl_socket.close()
+
+
+class Server(object):
+    SELECT_TIMEOUT = 10
+
+    def __init__(self, listen_addr="0.0.0.0", listen_port=4444):
+        self.listen_addr = listen_addr
+        self.listen_port = listen_port
+        self.listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listen_socket.setblocking(False)
+        self.shutdown_event = threading.Event()
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.clients = []
+        pipe = os.pipe()
+        self.poll_pipe = (os.fdopen(pipe[0], "r", 0), os.fdopen(pipe[1], "w", 0))
+        self.loop_thread = None
+
+    def remove_me(self, client):
+        self.clients.remove(client)
+
+    def poll(self):
+        self.poll_pipe[1].write("\x90")
+
+    def shutdown(self):
+        self.logger.info("request for shutdown server")
+        self.shutdown_event.set()
+        self.poll()
+        if self.loop_thread:
+            self.loop_thread.join()
+        self.loop_thread = None
+
+    def start_loop(self):
+        self.loop_thread = threading.Thread(target=self.loop)
+        self.loop_thread.daemon = True
+        self.loop_thread.start()
+
+    def loop(self):
+        self.logger.info("Server internal loop started.")
+        self.listen_socket.bind((self.listen_addr, self.listen_port))
+        self.listen_socket.listen(1)
+
+        while not self.shutdown_event.is_set():
+            inputs = [self.listen_socket, self.poll_pipe[0]]
+            outputs = []
+
+            for cl in self.clients:
+                s = cl.get_socket()
+                if s:
+                    inputs.append(s)
+                    if cl.want_write():
+                        outputs.append(s)
+
+            read_lst, write_lst, exc_lst = select.select(inputs, outputs, inputs, Server.SELECT_TIMEOUT)
+
+            # handle input
+            for s in read_lst:
+                if s is self.listen_socket:
+                    connection, address = s.accept()
+                    self.logger.info("Incoming connection from address %s", address)
+                    self.clients.append(ServerClient(connection, self))
+                elif s is self.poll_pipe[0]:
+                    self.logger.info("Polling")
+                    s.read(1)
+                else:
+                    self.logger.info("Socket is ready for reading")
+                    for cl in self.clients:
+                        if cl.get_socket() == s:
+                            cl.need_read()
+                        else:
+                            self.logger.error("Can't find client for this connection")
+
+            # handle write
+            for s in write_lst:
+                for cl in self.clients:
+                    if cl.get_socket() == s:
+                        cl.write_data()
+        self.listen_socket.close()
+        for cl in self.clients:
+            cl.close()
+        self.logger.info("Internal loop is ended")
 
 
 class TCPRequestHandler(BaseRequestHandlerDNS):
@@ -657,33 +771,22 @@ def main():
     parser.add_argument('--ipaddr', type=str, required=True, help='DNS IP')
 
     args = parser.parse_args()
-    global D
     ns_records = []
-    global IP
-    global TTL
-    global LPORT
     global dns_server
-    LPORT = args.lport
 
     D = DomainName(args.domain + '.')  # Init domain string
     ns_records.append(NS(D.ns1))
     ns_records.append(NS(D.ns2))
-    IP = args.ipaddr
-    TTL = 1
 
     client = Client('a')
     dns_server = DnsServer(args.domain, args.ipaddr, ns_records)
+    server = Server('0.0.0.0', args.lport)
+    server.start_loop()
 
     logger.info("Starting nameserver...")
 
     servers.append(SocketServer.ThreadingUDPServer(('', args.dport), UDPRequestHandler))
     servers.append(SocketServer.ThreadingTCPServer(('', args.dport), TCPRequestHandler))
-    servers.append(ThreadedTCPServer(('', LPORT), MeterBaseRequestHandler))
-    thread = threading.Thread(target=servers[-1].serve_forever)  # that thread will start one more thread for each request
-    thread.daemon = True  # exit the server thread when the main thread terminates
-    thread.start()
-
-    print("%s server loop running in thread: %s" % (servers[-1].RequestHandlerClass.__name__[:3], thread.name))
 
     for s in servers:
         thread = threading.Thread(target=s.serve_forever)  # that thread will start one more thread for each request
@@ -696,13 +799,14 @@ def main():
             time.sleep(1)
             sys.stderr.flush()
             sys.stdout.flush()
-
     except KeyboardInterrupt:
         pass
     finally:
         logger.info("Shutdown server...")
         for s in servers:
             s.shutdown()
+        server.shutdown()
+
 
 if __name__ == '__main__':
     main()
