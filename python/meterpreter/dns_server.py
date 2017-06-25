@@ -273,6 +273,7 @@ class Client(object):
                 self.server_queue.put(packet)
                 self._initial_state()
                 if self.server:
+                    self.logger.info("Notify server")
                     self.server.notify_data()
             except Exception:
                 self.logger.error("Error during decode received data", exc_info=True)
@@ -530,23 +531,25 @@ class BaseRequestHandlerDNS(SocketServer.BaseRequestHandler):
             logger.error("Exception", exc_info=True)
 
 
-class ServerClient(object):
+class MSFClient(object):
     HEADER_SIZE = 8
     BUFFER_SIZE = 2048
 
     INITIAL = 1
     RECEIVING_DATA = 2
 
-    LOGGER = logging.getLogger("ServerClient")
+    LOGGER = logging.getLogger("MSFClient")
 
     def __init__(self, sock, server):
         self.sock = sock
         self.ssl_socket = None
         self.data = ""
         self.need_read_size = 0
-        self.state = ServerClient.INITIAL
+        self.state = MSFClient.INITIAL
         self.server = server
         self.client_id = 'a'
+        client = get_client_by_id(self.client_id)
+        client.set_server(self)
         self._setup_ssl()
 
     def get_socket(self):
@@ -554,7 +557,7 @@ class ServerClient(object):
 
     def _setup_ssl(self):
         if self.ssl_socket is None:
-            ServerClient.LOGGER.info("Create ssl socket")
+            MSFClient.LOGGER.info("Create ssl socket")
             try:
                 self.sock.setblocking(True)
                 self.ssl_socket = ssl.wrap_socket(self.sock,
@@ -565,7 +568,8 @@ class ServerClient(object):
                 self.ssl_socket.setblocking(False)
                 self.ssl_socket.write("GET /123456789 HTTP/1.0\r\n\r\n")
             except:
-                ServerClient.LOGGER.error("Can't create ssl context:", exc_info=True)
+                MSFClient.LOGGER.error("Can't create ssl context:", exc_info=True)
+                self.sock.close()
                 self.server.remove_me(self)
 
     def _read_data(self, size):
@@ -573,37 +577,38 @@ class ServerClient(object):
         try:
             data = self.ssl_socket.recv(size)
             if not data:
-                ServerClient.LOGGER.info("Connection closed by client")
-                #self.ssl_socket.unwrap()
+                MSFClient.LOGGER.info("SSL connection closed by client")
+                # self.ssl_socket.unwrap()
                 self.ssl_socket = None
+                MSFClient.LOGGER.info("Trying to setup new SSL connection.")
                 self._setup_ssl()
                 return None
             return data
         except ssl.SSLWantReadError:
-            ServerClient.LOGGER.info("Not all data is prepared for decipher.Reread data later.")
+            MSFClient.LOGGER.info("Not all data is prepared for decipher.Reread data later.")
             #add small sleep
             time.sleep(0.1)
             return None
         except:
-            ServerClient.LOGGER.error("Exception during read", exc_info=True)
+            MSFClient.LOGGER.error("Exception during read", exc_info=True)
             return None
 
     def need_read(self):
-        if self.state == ServerClient.INITIAL:
+        if self.state == MSFClient.INITIAL:
             # read header
-            header = self._read_data(ServerClient.HEADER_SIZE)
+            header = self._read_data(MSFClient.HEADER_SIZE)
 
             if header is None:
                 return
 
-            if len(header) != ServerClient.HEADER_SIZE:
-                ServerClient.LOGGER.error("Can't read full header)")
+            if len(header) != MSFClient.HEADER_SIZE:
+                MSFClient.LOGGER.error("Can't read full header)")
                 return
-            ServerClient.LOGGER.debug("PARSE HEADER")
+            MSFClient.LOGGER.debug("PARSE HEADER")
             xor_key = header[:4][::-1]
             header_length = xor_bytes(xor_key, header[4:8])
             pkt_length = struct.unpack('>I', header_length)[0] - 4
-            ServerClient.LOGGER.info("incoming packet - need to read %d data", pkt_length)
+            MSFClient.LOGGER.info("incoming packet - need to read %d data", pkt_length)
             self.need_read_size = pkt_length
             self.data = header
 
@@ -617,7 +622,7 @@ class ServerClient(object):
             if self.need_read_size == 0:
                 self.send_to_client(self.client_id)
             else:
-                self.state = ServerClient.RECEIVING_DATA
+                self.state = MSFClient.RECEIVING_DATA
         else:
             data = self._read_data(self.need_read_size)
             if data is None:
@@ -638,22 +643,22 @@ class ServerClient(object):
         self.server.poll()
 
     def send_to_client(self, client_id):
-        ServerClient.LOGGER.info("All data from server is read. Sending to client.")
+        MSFClient.LOGGER.info("All data from server is read. Sending to client.")
         client = get_client_by_id(client_id)
         if client:
             client.server_put_data(self.data)
         else:
-            ServerClient.LOGGER.error("Client with id %s is not found.Dropping data", client_id)
+            MSFClient.LOGGER.error("Client with id %s is not found.Dropping data", client_id)
         self.data = ""
         self.need_read_size = 0
-        self.state = ServerClient.INITIAL
+        self.state = MSFClient.INITIAL
 
     def write_data(self):
         client = get_client_by_id(self.client_id)
         if client:
             data = client.server_get_data()
             if data:
-                ServerClient.LOGGER.info("Send data to server - %d bytes", len(data))
+                MSFClient.LOGGER.info("Send data to server - %d bytes", len(data))
                 self.ssl_socket.write(data)
 
     def close(self):
@@ -717,7 +722,7 @@ class Server(object):
                 if s is self.listen_socket:
                     connection, address = s.accept()
                     self.logger.info("Incoming connection from address %s", address)
-                    self.clients.append(ServerClient(connection, self))
+                    self.clients.append(MSFClient(connection, self))
                 elif s is self.poll_pipe[0]:
                     self.logger.info("Polling")
                     s.read(1)
