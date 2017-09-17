@@ -532,14 +532,16 @@ static DWORD packet_transmit_dns(Remote *remote, LPBYTE packet, DWORD packetLeng
         return 0;
     }
 
-    memcpy(buffer, &packet, packetLength);
+
+    vdprintf("[PACKET TRANSMIT WINDNS] Packet: %p - size %d", packet, packetLength);
+    memcpy(buffer, packet, packetLength);
 
     DWORD  buffLen = packetLength;
     need_to_send = ((buffLen/5) + (buffLen % 5 > 0 ? 1 : 0)) * 8 ;
     
     base64 = (wchar_t *)calloc(need_to_send + 1, sizeof(wchar_t));
     
-    ngx_txid_base32_encode(base64, buffer, buffLen);
+    ngx_txid_base32_encode(base64, packet, packetLength);
     
     vdprintf("[PACKET TRANCIEVE WINDNS] BEFOR: '%S'",base64);
     DWORD padd_ = 0;
