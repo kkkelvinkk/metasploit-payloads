@@ -857,11 +857,10 @@ static DWORD packet_receive_dns(Remote *remote, Packet **packet)
     //LONG bytesRead;
     BOOL inHeader = TRUE;
     PUCHAR payload = NULL;
-    ULONG payloadLength;
+    ULONG payloadLength = 0;
     DnsTransportContext* ctx = (DnsTransportContext*)remote->transport->ctx;
     DWORD retries = 5;
     IncapuslatedDns recieved;
-    CryptoContext* crypto = NULL;
     wchar_t *sub_seq = L"aaaa";
     
     recieved.packet = NULL;
@@ -881,29 +880,61 @@ static DWORD packet_receive_dns(Remote *remote, Packet **packet)
             memcpy(&header, recieved.packet, sizeof(PacketHeader));
             dprintf("[PACKET RECEIVE DNS] decoding header");
            
-            xor_bytes(header.xor_key, (LPBYTE)&header.length, 8);
-            header.length = ntohl(header.length);
-            dprintf("[PACKET RECEIVE DNS] key:0x%x len:0x%x",header.xor_key, header.length);
+            // xor the header data
+            xor_bytes(header.xor_key, (PUCHAR)&header + sizeof(header.xor_key), sizeof(PacketHeader) - sizeof(header.xor_key));
+#ifdef DEBUGTRACE
+            PUCHAR h = (PUCHAR)&header;
+            vdprintf("[PACKET RECEIVE DNS] Packet header: [0x%02X 0x%02X 0x%02X 0x%02X] [0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X] [0x%02X 0x%02X 0x%02X 0x%02X] [0x%02X 0x%02X 0x%02X 0x%02X] [0x%02X 0x%02X 0x%02X 0x%02X]",
+                h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15], h[16], h[17], h[18], h[19], h[20], h[21], h[22], h[23], h[24], h[25], h[26], h[27], h[28], h[29], h[30], h[31]);
+#endif
+            //header.length = ntohl(header.length);
+            //dprintf("[PACKET RECEIVE DNS] key:0x%x len:0x%x",header.xor_key, header.length);
             // Initialize the header
-            vdprintf("[PACKET RECEIVE DNS] tlv length: %d", header.length);
+            vdprintf("[PACKET RECEIVE DNS] tlv length: %d", ntohl(header.length));
             // use TlvHeader size here, because the length doesn't include the xor byte
-            payloadLength = header.length - sizeof(TlvHeader);
+            payloadLength = ntohl(header.length) - sizeof(TlvHeader);
+            vdprintf("[PACKET RECEIVE DNS] Payload length is %d", payloadLength);
+            DWORD packetSize = sizeof(PacketHeader) + payloadLength;
+            vdprintf("[PACKET RECEIVE DNS] total buffer size for the packet is %d", packetSize);
             // Allocate the payload
-            if (!(payload = (PUCHAR)malloc(payloadLength)))
+            if (!(payload = (PUCHAR)malloc(packetSize)))
             {
                 SetLastError(ERROR_NOT_ENOUGH_MEMORY);
                 vdprintf("[PACKET RECEIVE DNS] ERROR_NOT_ENOUGH_MEMORY");
             
             } else {
                
-                dprintf("[PACKET RECEIVE DNS] alloc %d",payloadLength);
-                
-                memcpy(payload, recieved.packet + sizeof(header), payloadLength);
+                dprintf("[PACKET RECEIVE DNS] alloc %d", packetSize);
+                memcpy_s(payload, packetSize, recieved.packet, packetSize);
                     
-                dprintf("[PACKET RECEIVE DNS] decoding payload");
-                xor_bytes(header.xor_key, payload, payloadLength);
+#ifdef DEBUGTRACE
+                h = (PUCHAR)&header.session_guid[0];
+                dprintf("[PACKET RECEIVE DNS] Packet Session GUID: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+                    h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]);
+#endif
+                if (is_null_guid(header.session_guid) || memcmp(remote->orig_config->session.session_guid, header.session_guid, sizeof(header.session_guid)) == 0)
+                {
+                    dprintf("[PACKET RECEIVE DNS] Session GUIDs match (or packet guid is null), decrypting packet");
+                    SetLastError(decrypt_packet(remote, packet, payload, packetSize));
+                }
+                else
+                {
+                    dprintf("[TCP] Session GUIDs don't match, looking for a pivot");
+                    PivotContext* pivotCtx = pivot_tree_find(remote->pivot_sessions, header.session_guid);
+                    if (pivotCtx != NULL)
+                    {
+                        dprintf("[TCP] Pivot found, dispatching packet on a thread (to avoid main thread blocking)");
+                        SetLastError(pivot_packet_dispatch(pivotCtx, payload, packetSize));
 
-                SetLastError(decrypt_packet(remote, packet, payload, payloadLength));
+                        // mark this packet buffer as NULL as the thread will clean it up
+                        payload = NULL;
+                        *packet = NULL;
+                    }
+                    else
+                    {
+                        dprintf("[TCP] Session GUIDs don't match, can't find pivot!");
+                    }
+                }
             }
             
             // Cleanup on failure

@@ -807,7 +807,7 @@ class PartedDataReader(object):
 
 
 class MSFClient(object):
-    HEADER_SIZE = 8
+    HEADER_SIZE = 32
     BUFFER_SIZE = 2048
 
     LOGGER = logging.getLogger("MSFClient")
@@ -859,8 +859,10 @@ class MSFClient(object):
                 MSFClient.LOGGER.info("SSL connection closed by client")
                 # self.ssl_socket.unwrap()
                 self.ssl_socket = None
-                MSFClient.LOGGER.info("Trying to setup new SSL connection.")
-                self._setup_ssl()
+                #MSFClient.LOGGER.info("Trying to setup new SSL connection.")
+                #self._setup_ssl()
+                self.working_socket.close()
+                self.server.remove_me(self)
                 return None
             return data
         except ssl.SSLWantReadError:
@@ -876,13 +878,14 @@ class MSFClient(object):
                     MSFClient.LOGGER.info("Closing MSF connection and unregister client with id %s", client_id)
                     Registrator.instance().unregister_client(client_id)
             MSFClient.LOGGER.error("Exception during read", exc_info=True)
+            self.server.remove_me(self)
             return None
 
     def on_new_client(self):
         with self.lock:
             if not self.client:
                 if self._setup_client():
-                    self._setup_ssl()
+                    #self._setup_ssl()
                     self._setup_tlv_reader()
                     Registrator.instance().unsubscribe(self.msf_id, self)
                     self.wait_client = False
@@ -932,7 +935,8 @@ class MSFClient(object):
             self._setup_stage_reader(without_data=True)
         elif self._setup_client():
             MSFClient.LOGGER.info("Client is found.Setup tlv reader.")
-            self._setup_ssl()
+            #self._setup_ssl()
+            self.working_socket.write("GET /123456789 HTTP/1.0\r\n\r\n")
             self._setup_tlv_reader()
         else:
             MSFClient.LOGGER.info("There are no clients for server id %s. Create subscription", self.msf_id)
@@ -975,10 +979,11 @@ class MSFClient(object):
             return 0, None
 
         MSFClient.LOGGER.debug("PARSE HEADER")
-        xor_key = header[:4][::-1]
-        pkt_length_binary = xor_bytes(xor_key, header[4:8])
+        xor_key = header[:4]
+        pkt_length_binary = xor_bytes(xor_key, header[24:28])
         pkt_length = struct.unpack('>I', pkt_length_binary)[0]
-        return pkt_length+4, header
+        MSFClient.LOGGER.info("Packet length %d", pkt_length)
+        return pkt_length+24, header
 
     def _read_tlv_complete(self, data):
         MSFClient.LOGGER.info("All data from server is read. Sending to client.")
@@ -1023,7 +1028,7 @@ class MSFClient(object):
             data = self.client.server_get_data()
             if data:
                 MSFClient.LOGGER.info("Send data to server - %d bytes", len(data))
-                self.working_socket.write(data)
+                self.working_socket.send(data)
 
     def close(self):
         self.working_socket.close()
