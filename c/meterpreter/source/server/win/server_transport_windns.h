@@ -10,6 +10,8 @@
 #include <windns.h>
 #pragma comment (lib, "Dnsapi.lib")
 
+
+
 #pragma pack(push, 1)
 typedef struct _IncapuslatedDns
 {
@@ -49,6 +51,7 @@ typedef struct _DNSThreadParams
     int index_stop;
 	wchar_t *subd;
 	wchar_t *domain;
+    wchar_t *client_id;
 	PIP4_ARRAY pSrvList;
 	UINT size;
     UINT status;

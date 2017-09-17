@@ -76,9 +76,12 @@ VOID load_stageless_extensions(Remote* remote, MetsrvExtension* stagelessExtensi
 	while (stagelessExtensions->size > 0)
 	{
 		dprintf("[SERVER] Extension located at 0x%p: %u bytes", stagelessExtensions->dll, stagelessExtensions->size);
-		HMODULE hLibrary = LoadLibraryR(stagelessExtensions->dll, stagelessExtensions->size);
-		load_extension(hLibrary, TRUE, remote, NULL, extensionCommands);
-		stagelessExtensions = (MetsrvExtension*)((LPBYTE)stagelessExtensions->dll + stagelessExtensions->size);
+		dprintf("1");
+        HMODULE hLibrary = LoadLibraryR(stagelessExtensions->dll, stagelessExtensions->size);
+		dprintf("2");
+        load_extension(hLibrary, TRUE, remote, NULL, extensionCommands);
+		dprintf("3");
+        stagelessExtensions = (MetsrvExtension*)((LPBYTE)stagelessExtensions->dll + stagelessExtensions->size);
 	}
 
 	dprintf("[SERVER] All stageless extensions loaded");

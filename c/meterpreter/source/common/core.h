@@ -160,6 +160,8 @@ typedef enum
 	TLV_TYPE_TRANS_RETRY_WAIT    = TLV_VALUE(TLV_META_TYPE_UINT,      440),   ///! Time (seconds) to wait between reconnect attempts.
 	TLV_TYPE_TRANS_GROUP         = TLV_VALUE(TLV_META_TYPE_GROUP,     441),   ///! A single transport grouping.
     TLV_TYPE_TRANS_NSHOST        = TLV_VALUE(TLV_META_TYPE_STRING,    470),   ///! NS host
+    TLV_TYPE_TRANS_CLIENT_ID     = TLV_VALUE(TLV_META_TYPE_STRING,    471),   ///! CLIENT ID
+    TLV_TYPE_TRANS_SERVER_ID     = TLV_VALUE(TLV_META_TYPE_STRING,    472),   ///! SERVER ID
 	// session/machine identification
 	TLV_TYPE_MACHINE_ID          = TLV_VALUE(TLV_META_TYPE_STRING,    460),   ///! Represents a machine identifier.
 	TLV_TYPE_UUID                = TLV_VALUE(TLV_META_TYPE_RAW,       461),   ///! Represents a UUID.

