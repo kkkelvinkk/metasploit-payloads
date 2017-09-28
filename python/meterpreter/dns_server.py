@@ -256,6 +256,7 @@ class BlockSizedData(object):
 
 class Registrator(object):
     __instance = None
+    CLIENT_TIMEOUT = 40
 
     @staticmethod
     def instance():
@@ -272,6 +273,11 @@ class Registrator(object):
         self.lock = threading.Lock()
         self.logger = logging.getLogger(self.__class__.__name__)
         self.default_stager = StageClient()
+        self.timeout_service = TimeoutService(timeout=20)
+        self.timeout_service.add_callback(self.on_timeout)
+
+    def shutdown(self):
+        self.timeout_service.remove_callback(self.on_timeout)
 
     def register_client_for_server(self, server_id, client):
         client_id = None
@@ -358,6 +364,68 @@ class Registrator(object):
                 self.id_list.append(client_id)
                 self.logger.error("Unregister client with id %s successfully", client_id)
 
+    def on_timeout(self, cur_time):
+        disconnect_client_lst = []
+        with self.lock:
+            ids_for_remove = []
+            for client_id, client in self.clientMap.iteritems():
+                if abs(cur_time - client.ts) >= self.CLIENT_TIMEOUT:
+                    ids_for_remove.append(client_id)
+                    disconnect_client_lst.append(client)
+
+            for client_id in ids_for_remove:
+                del self.clientMap[client_id]
+                self.id_list.append(client_id)
+                self.logger.info("Unregister client with '%s' id(reason: timeout)", client_id)
+
+            ids_for_remove = [server_id for server_id, client in self.stagers.iteritems()
+                              if abs(client.ts - cur_time) >= self.CLIENT_TIMEOUT * 4]
+
+            for server_id in ids_for_remove:
+                del self.stagers[server_id]
+                self.logger.info("Clearing stager client for server with '%s' id(reason: timeout)", server_id)
+
+        for client in disconnect_client_lst:
+            client.on_timeout()
+
+
+class TimeoutService(object):
+    DEFAULT_TIMEOUT = 40
+
+    def __init__(self, timeout=DEFAULT_TIMEOUT):
+        self.timeout = timeout
+        self.timer = None
+        self.lock = threading.RLock()
+        self.listeners = set()
+
+    def _setup_timer(self):
+        if self.timer:
+            self.timer.cancel()
+        self.timer = threading.Timer(self.timeout, self.timer_expired)
+        self.timer.start()
+
+    def timer_expired(self):
+        with self.lock:
+            for listener in self.listeners:
+                cur_time = int(time.time())
+                listener(cur_time)
+            self._setup_timer()
+
+    def add_callback(self, callback):
+        with self.lock:
+            num_listeners = len(self.listeners)
+            self.listeners.add(callback)
+            if num_listeners == 0:
+                self._setup_timer()
+
+    def remove_callback(self, callback):
+        with self.lock:
+            with ignored(KeyError):
+                self.listeners.remove(callback)
+            if len(self.listeners) == 0 and self.timer is not None:
+                self.timer.cancel()
+                self.timer = None
+
 
 class Client(object):
     INITIAL = 1
@@ -375,6 +443,10 @@ class Client(object):
         self.client_queue = Queue.Queue()
         self.server = None
         self.client_id = None
+        self.ts = 0
+
+    def update_last_request_ts(self):
+        self.ts = int(time.time())
 
     def register_client(self, server_id, encoder):
         client_id = Registrator.instance().register_client_for_server(server_id, self)
@@ -510,6 +582,11 @@ class Client(object):
     def server_has_data(self):
         return not self.server_queue.empty()
 
+    def on_timeout(self):
+        if self.server:
+            self.server.on_client_timeout()
+            self.server = None
+
 
 class StageClient(object):
     subdomain = '7812'
@@ -518,6 +595,10 @@ class StageClient(object):
         self.stage_data = data
         self.data_len = len(data) if data else 0
         self.encoder_data = {}
+        self.ts = 0
+
+    def update_last_request_ts(self):
+        self.ts = int(time.time())
 
     def request_data_header(self, encoder):
         return encoder.encode_data_header(self.subdomain, self.data_len)
@@ -562,6 +643,7 @@ class Request(object):
 
         if client:
             Request.LOGGER.info("Request will be handled by class %s", cls.__name__)
+            client.update_last_request_ts()
             params["encoder"] = dns_cls.encoder
             return cls._handle_client(client, **params)
         else:
@@ -805,11 +887,8 @@ class PartedDataReader(object):
             self.continue_func()
 
 
-
 class MSFClient(object):
     HEADER_SIZE = 32
-    BUFFER_SIZE = 2048
-
     LOGGER = logging.getLogger("MSFClient")
 
     def __init__(self, sock, server):
@@ -818,9 +897,8 @@ class MSFClient(object):
         sock.setsockopt(socket.SOL_TCP, socket.TCP_KEEPIDLE, 60)
         sock.setsockopt(socket.SOL_TCP, socket.TCP_KEEPCNT, 4)
         sock.setsockopt(socket.SOL_TCP, socket.TCP_KEEPINTVL, 15)
+        sock.setblocking(False)
         self.sock = sock
-        self.ssl_socket = None
-        self.working_socket = sock
         self.server = server
         self.msf_id = ""
         self.client = None
@@ -831,45 +909,25 @@ class MSFClient(object):
         self._setup_id_reader()
 
     def get_socket(self):
-        return self.working_socket if not self.wait_client else None
-
-    def _setup_ssl(self):
-        if self.ssl_socket is None:
-            MSFClient.LOGGER.info("Create ssl socket")
-            try:
-                self.sock.setblocking(True)
-                self.ssl_socket = ssl.wrap_socket(self.sock,
-                            # keyfile = "server.key",
-                            # ca_certs="server.crt",
-                            cert_reqs=ssl.CERT_NONE,
-                            server_side=False)
-                self.ssl_socket.setblocking(False)
-                self.ssl_socket.write("GET /123456789 HTTP/1.0\r\n\r\n")
-                self.working_socket = self.ssl_socket
-            except:
-                MSFClient.LOGGER.error("Can't create ssl context:", exc_info=True)
-                self.sock.close()
-                self.server.remove_me(self)
+        return self.sock if not self.wait_client else None
 
     def _read_data(self, size):
         data = None
         try:
-            data = self.working_socket.recv(size)
+            data = self.sock.recv(size)
             if not data:
-                MSFClient.LOGGER.info("SSL connection closed by client")
-                # self.ssl_socket.unwrap()
-                self.ssl_socket = None
-                #MSFClient.LOGGER.info("Trying to setup new SSL connection.")
-                #self._setup_ssl()
-                self.working_socket.close()
+                MSFClient.LOGGER.info("Connection closed by msf")
+                if self.client:
+                    client_id = self.client.get_id()
+                    if client_id:
+                        Registrator.instance().unregister_client(client_id)
+                    self.client.set_server(None)
+                    self.client = None
+                self.sock.close()
+                self.sock = None
                 self.server.remove_me(self)
                 return None
             return data
-        except ssl.SSLWantReadError:
-            MSFClient.LOGGER.info("Not all data is prepared for decipher.Reread data later.")
-            # add small sleep
-            time.sleep(0.1)
-            return None
         except:
             # connection closed
             if self.client:
@@ -877,6 +935,8 @@ class MSFClient(object):
                 if client_id:
                     MSFClient.LOGGER.info("Closing MSF connection and unregister client with id %s", client_id)
                     Registrator.instance().unregister_client(client_id)
+                self.client.set_server(None)
+                self.client = None
             MSFClient.LOGGER.error("Exception during read", exc_info=True)
             self.server.remove_me(self)
             return None
@@ -885,7 +945,6 @@ class MSFClient(object):
         with self.lock:
             if not self.client:
                 if self._setup_client():
-                    #self._setup_ssl()
                     self._setup_tlv_reader()
                     Registrator.instance().unsubscribe(self.msf_id, self)
                     self.wait_client = False
@@ -935,8 +994,6 @@ class MSFClient(object):
             self._setup_stage_reader(without_data=True)
         elif self._setup_client():
             MSFClient.LOGGER.info("Client is found.Setup tlv reader.")
-            #self._setup_ssl()
-            self.working_socket.write("GET /123456789 HTTP/1.0\r\n\r\n")
             self._setup_tlv_reader()
         else:
             MSFClient.LOGGER.info("There are no clients for server id %s. Create subscription", self.msf_id)
@@ -961,7 +1018,6 @@ class MSFClient(object):
         MSFClient.LOGGER.info("Stage read is done. Drop data and continue.")
         if self._setup_client():
             MSFClient.LOGGER.info("Client is found.Setup tlv reader.")
-            self._setup_ssl()
             self._setup_tlv_reader()
         else:
             MSFClient.LOGGER.info("There are no clients for server id %s. Create subscription", self.msf_id)
@@ -1028,10 +1084,17 @@ class MSFClient(object):
             data = self.client.server_get_data()
             if data:
                 MSFClient.LOGGER.info("Send data to server - %d bytes", len(data))
-                self.working_socket.send(data)
+                self.sock.send(data)
 
     def close(self):
-        self.working_socket.close()
+        self.sock.close()
+
+    def on_client_timeout(self):
+        MSFClient.LOGGER.info("Closing connection.(client timeout)")
+        self.client = None
+        self.server.remove_me(self)
+        self.close()
+        self.polling()
 
 
 class MSFListener(object):
@@ -1176,6 +1239,7 @@ def main():
         pass
     finally:
         logger.info("Shutdown server...")
+        Registrator.instance().shutdown()
         for s in servers:
             s.shutdown()
         listener.shutdown()
