@@ -13,12 +13,12 @@
 
 
 #pragma pack(push, 1)
-typedef struct _IncapuslatedDns
+typedef struct _IncapsulatedDns
 {
 	USHORT size;
 	PUCHAR packet;
 	USHORT status;
-} IncapuslatedDns;
+} IncapsulatedDns;
 
 
 typedef struct _DnsReverseHeader
@@ -57,8 +57,20 @@ typedef struct _DNSThreadParams
     UINT status;
 	UCHAR *result;
 } DNSThreadParams;
-
 #pragma pack(pop)
+
+typedef struct _DnsRequestContext
+{
+	USHORT start_index;
+	size_t num_tries;
+	WORD request_type;
+	const wchar_t* domain;
+	const wchar_t* id;
+	PDNS_RECORD records;
+	PIP4_ARRAY pSrvList;
+	size_t num_written;
+	wchar_t request[MAX_DNS_NAME_SIZE+1];
+} DnsRequestContext;
 
 
 void transport_write_dns_config(Transport* transport, MetsrvTransportDns* config);
