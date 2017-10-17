@@ -10,12 +10,10 @@
 #include <windns.h>
 #pragma comment (lib, "Dnsapi.lib")
 
-
-
 #pragma pack(push, 1)
 typedef struct _IncapsulatedDns
 {
-	USHORT size;
+	size_t size;
 	PUCHAR packet;
 	USHORT status;
 } IncapsulatedDns;
@@ -47,8 +45,8 @@ typedef struct _DnsTunnel
 typedef struct _DNSThreadParams
 {
 	PHANDLE mutex;
-	int index;
-    int index_stop;
+	size_t index;
+    size_t index_stop;
 	wchar_t *subd;
 	wchar_t *domain;
     wchar_t *client_id;
@@ -58,20 +56,6 @@ typedef struct _DNSThreadParams
 	UCHAR *result;
 } DNSThreadParams;
 #pragma pack(pop)
-
-typedef struct _DnsRequestContext
-{
-	USHORT start_index;
-	size_t num_tries;
-	WORD request_type;
-	const wchar_t* domain;
-	const wchar_t* id;
-	PDNS_RECORD records;
-	PIP4_ARRAY pSrvList;
-	size_t num_written;
-	wchar_t request[MAX_DNS_NAME_SIZE+1];
-} DnsRequestContext;
-
 
 void transport_write_dns_config(Transport* transport, MetsrvTransportDns* config);
 Transport* transport_create_dns(MetsrvTransportDns* config);
