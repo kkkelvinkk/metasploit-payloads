@@ -451,6 +451,46 @@ static eDnsStatus process_data_answer(PDNS_RECORD records, DNSThreadParams *lpPa
     return result;
 }
 
+static eDnsStatus ipv6_process_send_header(PDNS_RECORD records)
+{
+    eDnsStatus status = eSTATUS_SUCCESS;
+    DnsTunnel* tmp = ((DnsTunnel *)records->Data.AAAA.Ip6Address.IP6Byte);
+    if (tmp == NULL || tmp->block.header.status_flag != 0)
+    {
+        vdprintf("[PACKET TRANSMIT WINDNS] Header error");
+        status = eSTATUS_BAD_DATA;
+    }
+    return status;
+}
+
+static eDnsStatus ipv6_process_send(PDNS_RECORD records)
+{
+    eDnsStatus status = eSTATUS_SUCCESS;
+    if (records->Data.AAAA.Ip6Address.IP6Byte != NULL)
+    {
+        DnsTunnel* tmp = ((DnsTunnel *)records->Data.AAAA.Ip6Address.IP6Byte);
+        if (tmp->index_size == 0xff && tmp->block.header.status_flag == 0xf0)
+        {
+
+        }
+        else if((tmp->index_size == 0xff) && (tmp->block.header.status_flag == 0xff))
+        {
+            
+        }
+        else
+        {
+            // ERROR
+            status = eSTATUS_BAD_DATA;
+        }
+    }
+    else
+    {
+        vdprintf("[PACKET TRANSMIT WINDNS] response error, no data");
+        status = eSTATUS_DNS_NO_RECORDS;
+    }
+    return status;
+}
+
 DWORD WINAPI DnsGetDataThreadProc(DNSThreadParams *lpParam)
 {
     eDnsStatus dns_status = 0;
@@ -710,6 +750,7 @@ static DWORD packet_transmit_dns(Remote *remote, LPBYTE packet, DWORD packetLeng
     base64[need_to_send] = L'\0';
 
     DnsRequestContext* context = create_request_context(DNS_TYPE_AAAA, ctx->client_id, ctx->domain, ctx->pip4);
+    DnsRecordsHanlder* handler = get_records_handler(context->request_type);
     do
     {
         prepare_send_header_request(need_to_send, padd_, context);
@@ -721,11 +762,19 @@ static DWORD packet_transmit_dns(Remote *remote, LPBYTE packet, DWORD packetLeng
             break;
         }
 
-        DnsTunnel* tmp = ((DnsTunnel *)context->records->Data.AAAA.Ip6Address.IP6Byte);
-        if (tmp == NULL || tmp->block.header.status_flag != 0)
+        if (handler != NULL && handler->on_send_header != NULL)
         {
-            vdprintf("[PACKET TRANSMIT WINDNS] Header error");
-            ret = DNS_ERROR_INVALID_IP_ADDRESS;
+            dns_status = handler->on_send_header(context->records);
+            if (dns_status != eSTATUS_SUCCESS)
+            {
+                ret = DNS_ERROR_INVALID_IP_ADDRESS;
+                break;
+            }
+        }
+        else
+        {
+            vdprintf("[PACKET TRANSMIT WINDNS] Can't find handler for type %d.", context->request_type);
+            ret = 0;
             break;
         }
 
@@ -743,31 +792,26 @@ static DWORD packet_transmit_dns(Remote *remote, LPBYTE packet, DWORD packetLeng
 
             if (dns_status == eSTATUS_SUCCESS)
             {
-                if (context->records->Data.AAAA.Ip6Address.IP6Byte != NULL)
+                if ((handler != NULL) && (handler->on_send))
                 {
-                    DnsTunnel* tmp = ((DnsTunnel *)context->records->Data.AAAA.Ip6Address.IP6Byte);
-                    if (tmp->index_size == 0xff && tmp->block.header.status_flag == 0xf0)
+                    dns_status = handler->on_send(context->records);
+                    if (dns_status == eSTATUS_SUCCESS)
                     {
-                        index++;
-                        vdprintf("[PACKET TRANSMIT WINDNS] sent: %d from %d", need_to_send - data_size, need_to_send);
-                    }
-                    else if((tmp->index_size == 0xff) && (tmp->block.header.status_flag == 0xff))
-                    {
-                        vdprintf("[PACKET TRANSMIT WINDNS] repeat (finish): sent %d from %d bytes", need_to_send - data_size, need_to_send);
+                        ++index;
+                        vdprintf("[PACKET TRANSMIT WINDNS] sent: %d from %d", need_to_send - data_size,
+                                 need_to_send);
                     }
                     else
                     {
-                        // ERROR
-                        vdprintf("[PACKET TRANSMIT WINDNS] response error, wrong header 0x%x (%d from %d)", tmp->block.header.status_flag, need_to_send - data_size, need_to_send);
-                        ret = DNS_ERROR_INVALID_IP_ADDRESS;
+                        vdprintf("[PACKET TRANSMIT WINDNS] response error, wrong header (%d from %d)",
+                                 need_to_send - data_size, need_to_send);
                         break;
                     }
                 }
                 else
                 {
-                    vdprintf("[PACKET TRANSMIT WINDNS] response error, no data");
-                    ret = DNS_ERROR_NO_PACKET;
-                    break;
+                    vdprintf("[PACKET TRANSMIT WINDNS] Can't find hanlder for type(%d).",
+                             context->request_type);
                 }
             }
             else
@@ -913,11 +957,9 @@ static DWORD packet_receive_dns(Remote *remote, Packet **packet)
             {
                 SetLastError(ERROR_NOT_ENOUGH_MEMORY);
                 vdprintf("[PACKET RECEIVE DNS] ERROR_NOT_ENOUGH_MEMORY");
-
             }
             else
             {
-
                 dprintf("[PACKET RECEIVE DNS] alloc %d", packetSize);
                 memcpy_s(payload, packetSize, recieved.packet, packetSize);
 
@@ -966,23 +1008,19 @@ static DWORD packet_receive_dns(Remote *remote, Packet **packet)
         }
         else if (recieved.status == DNS_INFO_NO_RECORDS) // No data
         {
-
             SetLastError(DNS_INFO_NO_RECORDS);
             res = DNS_INFO_NO_RECORDS;
-
         }
-        else if (recieved.status == ERROR_READ_FAULT){ // ERROR
+        else if (recieved.status == ERROR_READ_FAULT)
+        { // ERROR
 
             SetLastError(ERROR_READ_FAULT);
             res = ERROR_READ_FAULT;
-
         }
         else
         {
-
             SetLastError(ERROR_READ_FAULT);
             res = ERROR_READ_FAULT;
-
         }
     }
     else
@@ -1002,7 +1040,6 @@ static DWORD packet_receive_dns(Remote *remote, Packet **packet)
             vdprintf("[PACKET RECEIVE DNS] Registration failed!");
             SetLastError(DNS_INFO_NO_RECORDS);
             res = DNS_INFO_NO_RECORDS;
-
         }
     }
 
@@ -1234,6 +1271,22 @@ static DnsRecordsHanlder _ipv6_records_handler = {
     &process_register_answer,
     &process_data_header_answer,
     &process_data_answer,
+    &ipv6_process_send_header,
+    &ipv6_process_send
+};
+
+static DnsRecordsHanlder _null_records_handler = {
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+};
+
+static DnsRecordsHanlder _dnskey_records_handler = {
+    NULL,
+    NULL,
+    NULL,
     NULL,
     NULL
 };
@@ -1247,8 +1300,10 @@ DnsRecordsHanlder* get_records_handler(WORD request_type)
             handler = &_ipv6_records_handler;
             break;
         case DNS_TYPE_NULL:
+            handler = &_null_records_handler;
             break;
         case DNS_TYPE_DNSKEY:
+            handler = &_dnskey_records_handler;
             break;
         default:
             break;
