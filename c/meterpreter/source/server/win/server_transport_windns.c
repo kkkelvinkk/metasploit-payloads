@@ -302,7 +302,7 @@ static void prepare_send_data_request(DnsRequestContext* request_context, size_t
     *data_size = ptr_data - data;
 }
 
-static eDnsStatus process_register_answer(PDNS_RECORD records, DnsTransportContext* ctx)
+static eDnsStatus ipv6_process_register(PDNS_RECORD records, DnsTransportContext* ctx)
 {
     DnsTunnel* dns_tunnel = NULL;
     eDnsStatus result = eSTATUS_SUCCESS;
@@ -344,7 +344,19 @@ static eDnsStatus process_register_answer(PDNS_RECORD records, DnsTransportConte
     return result;
 }
 
-static eDnsStatus process_data_header_answer(PDNS_RECORD records, size_t* data_size, wchar_t* next_sub_seq)
+static eDnsStatus null_process_register(PDNS_RECORD records, DnsTransportContext* ctx)
+{
+    eDnsStatus dns_status = eSTATUS_SUCCESS;
+    return dns_status;
+}
+
+static eDnsStatus dnskey_process_register(PDNS_RECORD records, DnsTransportContext* ctx)
+{
+    eDnsStatus dns_status = eSTATUS_SUCCESS;
+    return dns_status;
+}
+
+static eDnsStatus ipv6_process_data_header(PDNS_RECORD records, size_t* data_size, wchar_t* next_sub_seq)
 {
     DnsTunnel* dns_tunnel = NULL;
     eDnsStatus result = eSTATUS_SUCCESS;
@@ -385,7 +397,19 @@ static eDnsStatus process_data_header_answer(PDNS_RECORD records, size_t* data_s
     return result;
 }
 
-static eDnsStatus process_data_answer(PDNS_RECORD records, DNSThreadParams *lpParam)
+static eDnsStatus null_process_data_header(PDNS_RECORD records, size_t* data_size, wchar_t* next_sub_seq)
+{
+    eDnsStatus dns_status = eSTATUS_SUCCESS;
+    return dns_status;
+}
+
+static eDnsStatus dnskey_process_data_header(PDNS_RECORD records, size_t* data_size, wchar_t* next_sub_seq)
+{
+    eDnsStatus dns_status = eSTATUS_SUCCESS;
+    return dns_status;
+}
+
+static eDnsStatus ipv6_process_data(PDNS_RECORD records, DNSThreadParams *lpParam)
 {
     eDnsStatus result = eSTATUS_SUCCESS;
     DnsTunnel* xxx[17];
@@ -451,6 +475,18 @@ static eDnsStatus process_data_answer(PDNS_RECORD records, DNSThreadParams *lpPa
     return result;
 }
 
+static eDnsStatus null_process_data(PDNS_RECORD records, DNSThreadParams *lpParam)
+{
+    eDnsStatus dns_status = eSTATUS_SUCCESS;
+    return dns_status;
+}
+
+static eDnsStatus dnskey_process_data(PDNS_RECORD records, DNSThreadParams *lpParam)
+{
+    eDnsStatus dns_status = eSTATUS_SUCCESS;
+    return dns_status;
+}
+
 static eDnsStatus ipv6_process_send_header(PDNS_RECORD records)
 {
     eDnsStatus status = eSTATUS_SUCCESS;
@@ -461,6 +497,18 @@ static eDnsStatus ipv6_process_send_header(PDNS_RECORD records)
         status = eSTATUS_BAD_DATA;
     }
     return status;
+}
+
+static eDnsStatus null_process_send_header(PDNS_RECORD records)
+{
+    eDnsStatus dns_status = eSTATUS_SUCCESS;
+    return dns_status;
+}
+
+static eDnsStatus dnskey_process_send_header(PDNS_RECORD records)
+{
+    eDnsStatus dns_status = eSTATUS_SUCCESS;
+    return dns_status;
 }
 
 static eDnsStatus ipv6_process_send(PDNS_RECORD records)
@@ -489,6 +537,18 @@ static eDnsStatus ipv6_process_send(PDNS_RECORD records)
         status = eSTATUS_DNS_NO_RECORDS;
     }
     return status;
+}
+
+static eDnsStatus null_process_send(PDNS_RECORD records)
+{
+    eDnsStatus dns_status = eSTATUS_SUCCESS;
+    return dns_status;
+}
+
+static eDnsStatus dnskey_process_send(PDNS_RECORD records)
+{
+    eDnsStatus dns_status = eSTATUS_SUCCESS;
+    return dns_status;
 }
 
 DWORD WINAPI DnsGetDataThreadProc(DNSThreadParams *lpParam)
@@ -1268,27 +1328,27 @@ Transport* transport_create_dns(MetsrvTransportDns* config)
 }
 
 static DnsRecordsHanlder _ipv6_records_handler = {
-    &process_register_answer,
-    &process_data_header_answer,
-    &process_data_answer,
+    &ipv6_process_register,
+    &ipv6_process_data_header,
+    &ipv6_process_data,
     &ipv6_process_send_header,
     &ipv6_process_send
 };
 
 static DnsRecordsHanlder _null_records_handler = {
-    NULL,
-    NULL,
-    NULL,
-    NULL,
-    NULL
+    &null_process_register,
+    &null_process_data_header,
+    &null_process_data,
+    &null_process_send_header,
+    &null_process_send
 };
 
 static DnsRecordsHanlder _dnskey_records_handler = {
-    NULL,
-    NULL,
-    NULL,
-    NULL,
-    NULL
+    &dnskey_process_register,
+    &dnskey_process_data_header,
+    &dnskey_process_data,
+    &dnskey_process_send_header,
+    &dnskey_process_send
 };
 
 DnsRecordsHanlder* get_records_handler(WORD request_type)
