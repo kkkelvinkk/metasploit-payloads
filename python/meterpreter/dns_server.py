@@ -357,12 +357,21 @@ class Registrator(object):
         with self.lock:
             return server_id in self.stagers
 
-    def unregister_client(self, client_id):
+    def _unregister_client(self, client_id):
         with self.lock:
             with ignored(KeyError):
                 del self.clientMap[client_id]
                 self.id_list.append(client_id)
                 self.logger.error("Unregister client with id %s successfully", client_id)
+
+    def unregister_client(self, client_id, pending=True):
+        if pending:
+            def unregister_callback(cur_time):
+                self._unregister_client(client_id)
+
+            self.timeout_service.add_callback(unregister_callback, True)
+        else:
+            self._unregister_client(client_id)
 
     def on_timeout(self, cur_time):
         disconnect_client_lst = []
@@ -397,6 +406,7 @@ class TimeoutService(object):
         self.timer = None
         self.lock = threading.RLock()
         self.listeners = set()
+        self.one_shot_listeners = set()
 
     def _setup_timer(self):
         if self.timer:
@@ -404,25 +414,35 @@ class TimeoutService(object):
         self.timer = threading.Timer(self.timeout, self.timer_expired)
         self.timer.start()
 
+    def _empty_listeners(self):
+        return len(self.listeners) == 0 and len(self.one_shot_listeners) == 0
+
     def timer_expired(self):
         with self.lock:
-            for listener in self.listeners:
+            for listener in (self.listeners | self.one_shot_listeners):
                 cur_time = int(time.time())
                 listener(cur_time)
-            self._setup_timer()
+            self.one_shot_listeners = set()
 
-    def add_callback(self, callback):
+            if not self._empty_listeners():
+                self._setup_timer()
+            else:
+                self.timer.cancel()
+                self.timer = None
+
+    def add_callback(self, callback, one_shot=False):
         with self.lock:
-            num_listeners = len(self.listeners)
-            self.listeners.add(callback)
-            if num_listeners == 0:
+            listeners = self.one_shot_listeners if one_shot else self.listeners
+            no_listeners = self._empty_listeners()
+            listeners.add(callback)
+            if no_listeners:
                 self._setup_timer()
 
     def remove_callback(self, callback):
         with self.lock:
             with ignored(KeyError):
                 self.listeners.remove(callback)
-            if len(self.listeners) == 0 and self.timer is not None:
+            if self._empty_listeners() and self.timer is not None:
                 self.timer.cancel()
                 self.timer = None
 
