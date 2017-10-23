@@ -204,6 +204,14 @@ class IPv6Encoder(Encoder):
         return ["ffff:"+hex(ord(client_id))[2:4]+"00:0000:0000:0000:0000:0000:0000"]
 
 
+class DNSKeyEncoder(Encoder):
+    pass
+
+
+class NULLEncoder(Encoder):
+    pass
+
+
 class PartedData(object):
     def __init__(self, expected_size=0):
         self.expected_size = expected_size
@@ -280,19 +288,19 @@ class Registrator(object):
         self.timeout_service.remove_callback(self.on_timeout)
 
     def register_client_for_server(self, server_id, client):
+        with self.lock:
+            self.servers.setdefault(server_id, []).append(client)
+        self._notify_waited_servers(server_id)
+
+    def request_client_id(self, client):
         client_id = None
-        notify_server = False
         with self.lock:
             try:
                 client_id = self.id_list.pop(0)
                 self.clientMap[client_id] = client
-                self.servers.setdefault(server_id, []).append(client)
-                notify_server = True
             except IndexError as e:
-                self.logger.error("Can't register new client for server %s(no free ids)", server_id, exc_info=True)
+                self.logger.error("Can't find free id for new client.", exc_info=True)
                 return None
-        if notify_server:
-            self._notify_waited_servers(server_id)
         return client_id
 
     def _notify_waited_servers(self, server_id):
@@ -315,7 +323,7 @@ class Registrator(object):
         with self.lock:
             waited_lst = self.waited_servers.get(server_id, [])
             if waited_lst:
-                i = waited_lst.find(server)
+                i = waited_lst.index(server)
                 if i != -1:
                     self.logger.debug("Server with %s id is found on index %d", server_id, i)
                     waited_lst.pop(i)
@@ -395,6 +403,11 @@ class Registrator(object):
                 self.logger.info("Clearing stager client for server with '%s' id(reason: timeout)", server_id)
 
         for client in disconnect_client_lst:
+            if client.server_id:
+                clients = self.servers.get(client.server_id, [])
+                i = clients.index(client)
+                if i != -1:
+                    clients.remove(client)
             client.on_timeout()
 
 
@@ -463,15 +476,19 @@ class Client(object):
         self.client_queue = Queue.Queue()
         self.server = None
         self.client_id = None
+        self.server_id = None
+        self.register_for_server_needed = False
         self.ts = 0
 
     def update_last_request_ts(self):
         self.ts = int(time.time())
 
     def register_client(self, server_id, encoder):
-        client_id = Registrator.instance().register_client_for_server(server_id, self)
+        client_id = Registrator.instance().request_client_id(self)
         if client_id:
             self.client_id = client_id
+            self.server_id = server_id
+            self.register_for_server_needed = True
             self.logger.info("Registered new client with %s id for server_id %s", client_id, server_id)
             return encoder.encode_registration(client_id, 0)
         else:
@@ -548,6 +565,10 @@ class Client(object):
 
     def request_data_header(self, sub_domain, encoder):
         if sub_domain == self.sub_domain:
+            if self.register_for_server_needed:
+                Registrator.instance().register_client_for_server(self.server_id, self)
+                self.register_for_server_needed = False
+
             if not self.send_data:
                 with ignored(Queue.Empty):
                     self.logger.info("Checking client queue...")
@@ -749,7 +770,7 @@ class IncomingNewClient(Request):
         return client.register_client(kwargs['server_id'], kwargs['encoder'])
 
 
-class AAAARequestHandler(object):
+class DNSTunnelRequestHandler(object):
     encoder = IPv6Encoder
 
     def __init__(self, domain):
@@ -780,12 +801,38 @@ class AAAARequestHandler(object):
                 continue
             for rr in answer:
                 self.logger.debug("Add resource record to the reply %s", rr)
-                reply.add_answer(RR(rname=qname, rtype=QTYPE.AAAA, rclass=1, ttl=1,
-                                    rdata=AAAA(rr)))
+                self.process_rr(qname, rr, reply)
             break
         else:
             self.logger.error("Request with subdomain %s doesn't handled", qname)
 
+    def process_rr(self, qname, rr, reply):
+        raise NotImplementedError()
+
+
+class AAAARequestHandler(DNSTunnelRequestHandler):
+    encoder = IPv6Encoder
+
+    def process_rr(self, qname, rr, reply):
+        reply.add_answer(RR(rname=qname, rtype=QTYPE.AAAA, rclass=1, ttl=1,
+                            rdata=AAAA(rr)))
+
+class DNSKeyRequestHandler(DNSTunnelRequestHandler):
+     encoder = DNSKeyEncoder
+
+     def process_rr(self, qname, rr, reply):
+         reply.add_answer(RR(rname=qname, rtype=QTYPE.DNSKEY, rclass=1, ttl=1,
+                             rdata=DNSKEY(rr)))
+
+
+class NULLRequestHandler(DNSTunnelRequestHandler):
+    encoder = NULLEncoder
+
+    def process_rr(self, qname, rr, reply):
+        pass
+        # dnslib doesn't support NULL resource records
+        #reply.add_answer(RR(rname=qname, rtype=QTYPE.NULL, rclass=1, ttl=1,
+        #                    rdata=DNSNULL(rr)))
 
 class DnsServer(object):
     __instance = None
@@ -808,8 +855,10 @@ class DnsServer(object):
             QTYPE.NS: self._process_ns_request,
             QTYPE.A: self._process_a_request,
             QTYPE.AAAA: self._process_aaaa_request,
+            QTYPE.DNSKEY: self._process_dnskey_request
         }
         self.aaaa_handler = AAAARequestHandler(self.domain)
+        self.dnskey_handler = DNSKeyRequestHandler(self.domain)
 
     def process_request(self, request):
         reply = DNSRecord(DNSHeader(id=request.header.id, qr=1, aa=1, ra=1), q=request.q)
@@ -839,6 +888,10 @@ class DnsServer(object):
     def _process_aaaa_request(self, reply, qname):
         if self.aaaa_handler:
             self.aaaa_handler.process_request(reply, qname)
+
+    def _process_dnskey_request(self, reply, qname):
+        if self.dnskey_handler:
+            self.dnskey_handler.process_request(reply, qname)
 
 
 def dns_response(data):
