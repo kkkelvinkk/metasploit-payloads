@@ -206,7 +206,7 @@ class IPv6Encoder(Encoder):
 
 class DNSKeyEncoder(Encoder):
     HEADER_SIZE = 4 + 3 # 4 bytes dnskey header, 1 byte for status, 2 for data length
-    MAX_PACKET_SIZE = 65534 - HEADER_SIZE
+    MAX_PACKET_SIZE = 64900
     ALGO = 253
     PROTOCOL = 3
     FLAGS = 257
@@ -219,7 +219,7 @@ class DNSKeyEncoder(Encoder):
     @staticmethod
     def _encode_data(status=0, data=""):
         data_len = len(data)
-        return struct.pack("BH", status, data_len) + data
+        return struct.pack("<BH", status, data_len) + data
 
     @staticmethod
     def encode_data_header(sub_domain, data_size):
@@ -242,12 +242,12 @@ class DNSKeyEncoder(Encoder):
 
     @staticmethod
     def encode_finish_send():
-        key = key = DNSKeyEncoder._encode_data(status="\xf0")
+        key = DNSKeyEncoder._encode_data(status=0xf0)
         return [DNSKeyEncoder._encode_to_dnskey(key)]
 
     @staticmethod
     def encode_send_more_data():
-        key = key = DNSKeyEncoder._encode_data(status="\xff")
+        key = DNSKeyEncoder._encode_data(status=0xff)
         return [DNSKeyEncoder._encode_to_dnskey(key)]
 
     @staticmethod
