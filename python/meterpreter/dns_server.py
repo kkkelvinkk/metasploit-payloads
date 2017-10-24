@@ -371,10 +371,8 @@ class Registrator(object):
         with self.lock:
             waited_lst = self.waited_servers.get(server_id, [])
             if waited_lst:
-                i = waited_lst.index(server)
-                if i != -1:
-                    self.logger.debug("Server with %s id is found on index %d", server_id, i)
-                    waited_lst.pop(i)
+                with ignored(ValueError):
+                    waited_lst.remove(server)
         self.logger.info("Unsubscription is done for server with %s id.", server_id)
 
     def get_client_by_id(self, client_id):
@@ -447,8 +445,10 @@ class Registrator(object):
                               if abs(client.ts - cur_time) >= self.CLIENT_TIMEOUT * 4]
 
             for server_id in ids_for_remove:
-                del self.stagers[server_id]
-                self.logger.info("Clearing stager client for server with '%s' id(reason: timeout)", server_id)
+                waiters = self.waited_servers.get(server_id, [])
+                if not waiters:
+                    del self.stagers[server_id]
+                    self.logger.info("Clearing stager client for server with '%s' id(reason: timeout)", server_id)
 
         for client in disconnect_client_lst:
             if client.server_id:
@@ -1031,34 +1031,31 @@ class MSFClient(object):
     def get_socket(self):
         return self.sock if not self.wait_client else None
 
+    def _on_closing_connection(self):
+        if self.client:
+            client_id = self.client.get_id()
+            if client_id:
+                MSFClient.LOGGER.info("Unregister client with id %s", client_id)
+                Registrator.instance().unregister_client(client_id)
+            self.client.set_server(None)
+            self.client = None
+        Registrator.instance().unsubscribe(self.msf_id, self)
+        self.close()
+        self.server.remove_me(self)
+
     def _read_data(self, size):
         data = None
         try:
             data = self.sock.recv(size)
             if not data:
                 MSFClient.LOGGER.info("Connection closed by msf")
-                if self.client:
-                    client_id = self.client.get_id()
-                    if client_id:
-                        Registrator.instance().unregister_client(client_id)
-                    self.client.set_server(None)
-                    self.client = None
-                self.sock.close()
-                self.sock = None
-                self.server.remove_me(self)
+                self._on_closing_connection()
                 return None
             return data
         except:
             # connection closed
-            if self.client:
-                client_id = self.client.get_id()
-                if client_id:
-                    MSFClient.LOGGER.info("Closing MSF connection and unregister client with id %s", client_id)
-                    Registrator.instance().unregister_client(client_id)
-                self.client.set_server(None)
-                self.client = None
-            MSFClient.LOGGER.error("Exception during read", exc_info=True)
-            self.server.remove_me(self)
+            MSFClient.LOGGER.error("Exception during read. Closing connection.", exc_info=True)
+            self._on_closing_connection()
             return None
 
     def on_new_client(self):
@@ -1211,6 +1208,7 @@ class MSFClient(object):
 
     def close(self):
         self.sock.close()
+        self.sock = None
 
     def on_client_timeout(self):
         MSFClient.LOGGER.info("Closing connection.(client timeout)")
