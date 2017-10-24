@@ -122,7 +122,7 @@ class Encoder(object):
         raise NotImplementedError()
 
     @staticmethod
-    def encode_registration():
+    def encode_registration(client_id, status):
         raise NotImplementedError()
 
 
@@ -205,7 +205,55 @@ class IPv6Encoder(Encoder):
 
 
 class DNSKeyEncoder(Encoder):
-    pass
+    HEADER_SIZE = 4 + 3 # 4 bytes dnskey header, 1 byte for status, 2 for data length
+    MAX_PACKET_SIZE = 65534 - HEADER_SIZE
+    ALGO = 253
+    PROTOCOL = 3
+    FLAGS = 257
+
+    @staticmethod
+    def _encode_to_dnskey(key=""):
+        return DNSKEY(flags=DNSKeyEncoder.FLAGS, protocol=DNSKeyEncoder.PROTOCOL,
+                      algorithm=DNSKeyEncoder.ALGO, key=key)
+
+    @staticmethod
+    def _encode_data(status=0, data=""):
+        data_len = len(data)
+        return struct.pack("BH", status, data_len) + data
+
+    @staticmethod
+    def encode_data_header(sub_domain, data_size):
+        key_data = struct.pack("4sI", sub_domain, data_size)
+        key = DNSKeyEncoder._encode_data(data=key_data)
+        return [DNSKeyEncoder._encode_to_dnskey(key)]
+
+    @staticmethod
+    def encode_packet(packet_data):
+        data_len = len(packet_data)
+        if data_len > DNSKeyEncoder.MAX_PACKET_SIZE:
+            raise ValueError("Data length is bigger than maximum packet size")
+        key = DNSKeyEncoder._encode_data(data=packet_data)
+        return [DNSKeyEncoder._encode_to_dnskey(key)]
+
+    @staticmethod
+    def encode_ready_receive():
+        key = DNSKeyEncoder._encode_data()
+        return [DNSKeyEncoder._encode_to_dnskey(key)]
+
+    @staticmethod
+    def encode_finish_send():
+        key = key = DNSKeyEncoder._encode_data(status="\xf0")
+        return [DNSKeyEncoder._encode_to_dnskey(key)]
+
+    @staticmethod
+    def encode_send_more_data():
+        key = key = DNSKeyEncoder._encode_data(status="\xff")
+        return [DNSKeyEncoder._encode_to_dnskey(key)]
+
+    @staticmethod
+    def encode_registration(client_id, status):
+        key = DNSKeyEncoder._encode_data(status, client_id)
+        return [DNSKeyEncoder._encode_to_dnskey(key)]
 
 
 class NULLEncoder(Encoder):
@@ -405,8 +453,7 @@ class Registrator(object):
         for client in disconnect_client_lst:
             if client.server_id:
                 clients = self.servers.get(client.server_id, [])
-                i = clients.index(client)
-                if i != -1:
+                with ignored(ValueError):
                     clients.remove(client)
             client.on_timeout()
 
@@ -822,7 +869,7 @@ class DNSKeyRequestHandler(DNSTunnelRequestHandler):
 
      def process_rr(self, qname, rr, reply):
          reply.add_answer(RR(rname=qname, rtype=QTYPE.DNSKEY, rclass=1, ttl=1,
-                             rdata=DNSKEY(rr)))
+                             rdata=rr))
 
 
 class NULLRequestHandler(DNSTunnelRequestHandler):
