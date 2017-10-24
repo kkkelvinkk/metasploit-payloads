@@ -1109,10 +1109,13 @@ class MSFClient(object):
     def _read_id_complete(self, data):
         MSFClient.LOGGER.info("Id read is done")
         self.msf_id = data.get_data()
+
         if Registrator.instance().is_stager_server(self.msf_id):
-            MSFClient.LOGGER.info("Start reading stage without sending to client")
-            self._setup_stage_reader(without_data=True)
-        elif self._setup_client():
+            MSFClient.LOGGER.info("Stager has already read for this server id(%s). Continue.", self.msf_id)
+            # MSFClient.LOGGER.info("Start reading stage without sending to client")
+            #self._setup_stage_reader(without_data=True)
+
+        if self._setup_client():
             MSFClient.LOGGER.info("Client is found.Setup tlv reader.")
             self._setup_tlv_reader()
         else:
