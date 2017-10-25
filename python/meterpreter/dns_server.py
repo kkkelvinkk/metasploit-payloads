@@ -206,7 +206,7 @@ class IPv6Encoder(Encoder):
 
 class DNSKeyEncoder(Encoder):
     HEADER_SIZE = 4 + 3 # 4 bytes dnskey header, 1 byte for status, 2 for data length
-    MAX_PACKET_SIZE = 64900
+    MAX_PACKET_SIZE = 16384
     ALGO = 253
     PROTOCOL = 3
     FLAGS = 257
@@ -907,7 +907,7 @@ class DnsServer(object):
         self.aaaa_handler = AAAARequestHandler(self.domain)
         self.dnskey_handler = DNSKeyRequestHandler(self.domain)
 
-    def process_request(self, request):
+    def process_request(self, request, transport):
         reply = DNSRecord(DNSHeader(id=request.header.id, qr=1, aa=1, ra=1), q=request.q)
         qn = str(request.q.qname)
         qtype = request.q.qtype
@@ -922,7 +922,12 @@ class DnsServer(object):
             self.logger.info("DNS request for domain %s is not handled by this server. Sending empty answer.", qn)
         self.logger.info("Send reply for DNS request")
         self.logger.debug("Reply data: %s", reply)
-        return reply.pack()
+        answer = reply.pack()
+        if (len(answer) > 575) and (transport == BaseRequestHandlerDNS.TRANSPORT_UDP):
+            # send truncate flag
+            reply = DNSRecord(DNSHeader(id=request.header.id, qr=1, aa=1, ra=1, tc=1), q=request.q)
+            answer = reply.pack()
+        return answer
 
     def _process_ns_request(self, reply, qname):
         for server in self.ns_servers:
@@ -941,12 +946,12 @@ class DnsServer(object):
             self.dnskey_handler.process_request(reply, qname)
 
 
-def dns_response(data):
+def dns_response(data, transport):
     try:
         request = DNSRecord.parse(data)
         dns_server = DnsServer.instance()
         if dns_server:
-            return dns_server.process_request(request)
+            return dns_server.process_request(request, transport)
         else:
             logger.error("Can't get dns server instance.")
     except Exception as e:
@@ -954,6 +959,10 @@ def dns_response(data):
 
 
 class BaseRequestHandlerDNS(SocketServer.BaseRequestHandler):
+    TRANSPORT_UDP = 1
+    TRANSPORT_TCP = 2
+    TRANSPORT = TRANSPORT_UDP
+
     def get_data(self):
         raise NotImplementedError
 
@@ -966,7 +975,7 @@ class BaseRequestHandlerDNS(SocketServer.BaseRequestHandler):
         try:
             data = self.get_data()
             logger.debug("Size:%d, data %s", len(data), data)
-            dns_ans = dns_response(data)
+            dns_ans = dns_response(data, self.TRANSPORT)
             if dns_ans:
                 self.send_data(dns_ans)
         except Exception:
@@ -1299,6 +1308,8 @@ class MSFListener(object):
 
 
 class TCPRequestHandler(BaseRequestHandlerDNS):
+    TRANSPORT = BaseRequestHandlerDNS.TRANSPORT_TCP
+
     def get_data(self):
         data = self.request.recv(8192)
         sz = struct.unpack('>H', data[:2])[0]
@@ -1314,6 +1325,8 @@ class TCPRequestHandler(BaseRequestHandlerDNS):
 
 
 class UDPRequestHandler(BaseRequestHandlerDNS):
+    TRANSPORT = BaseRequestHandlerDNS.TRANSPORT_UDP
+
     def get_data(self):
         return self.request[0]
 

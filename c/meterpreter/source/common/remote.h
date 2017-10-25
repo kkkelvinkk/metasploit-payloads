@@ -104,6 +104,7 @@ typedef struct _HttpTransportContext
 typedef struct _DnsTransportContext
 {
 	BOOL ready; 
+	WORD request_type;
 	wchar_t *domain;                         ///! Pointer to the DNS domain stored with the transport.
 	wchar_t *ns_server;
     wchar_t *client_id;
@@ -111,7 +112,6 @@ typedef struct _DnsTransportContext
 	USHORT counter;
 	DWORD type;
 	PVOID pip4;
-	     
 } DnsTransportContext;
 
 typedef struct _Transport

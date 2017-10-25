@@ -34,19 +34,19 @@ typedef union _DnsData
 	DnsReverseHeader header;
 } DnsData;
 
-typedef struct _DnsTunnel
+typedef struct _DnsIPv6Tunnel
 {
 	BYTE ff;
 	BYTE index_size;
 	DnsData block;
-
-} DnsTunnel;
+} DnsIPv6Tunnel;
 
 typedef struct _DNSThreadParams
 {
 	PHANDLE mutex;
 	size_t index;
     size_t index_stop;
+	WORD request_type;
 	wchar_t *subd;
 	wchar_t *domain;
     wchar_t *client_id;
