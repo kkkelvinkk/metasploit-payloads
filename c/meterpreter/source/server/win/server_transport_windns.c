@@ -341,7 +341,7 @@ static eDnsStatus ipv6_process_register(PDNS_RECORD records, DnsTransportContext
             vdprintf("[PACKET RECEIVE WINDNS] CLIENT ID: '%x'", dns_tunnel->block.data[0]);
             SAFE_FREE(ctx->client_id);
             ctx->client_id = (wchar_t*)calloc(2,sizeof(wchar_t));
-            swprintf(ctx->client_id, 2*sizeof(wchar_t), L"%c", dns_tunnel->block.data[0]);
+            swprintf(ctx->client_id, 2, L"%c", dns_tunnel->block.data[0]);
             ctx->ready = TRUE;
         }
         else
@@ -381,7 +381,7 @@ static eDnsStatus dnskey_process_register(PDNS_RECORD records, DnsTransportConte
                     vdprintf("[PACKET RECEIVE WINDNS] CLIENT ID: '%x'", tunnel_data->data[0]);
                     SAFE_FREE(ctx->client_id);
                     ctx->client_id = (wchar_t*)calloc(2,sizeof(wchar_t));
-                    swprintf(ctx->client_id, 2*sizeof(wchar_t), L"%c", tunnel_data->data[0]);
+                    swprintf(ctx->client_id, 2, L"%c", tunnel_data->data[0]);
                     ctx->ready = TRUE;
                 }
                 else
@@ -1312,7 +1312,7 @@ static BOOL server_init_windns(Transport* transport)
     }
     ctx->pip4 = (PVOID)pSrvList;
     //ctx->request_type = DNS_TYPE_DNSKEY;
-    ctx->request_type = DNS_TYPE_AAAA;
+    //ctx->request_type = DNS_TYPE_AAAA;
 
     if (ctx->client_id == NULL || ctx->client_id[0] == L'\0' || ctx->client_id[0] == L'0')
     {
@@ -1441,26 +1441,37 @@ static void transport_destroy_dns(Transport* transport)
 void transport_write_dns_config(Transport* transport, MetsrvTransportDns* config)
 {
     DnsTransportContext* ctx = (DnsTransportContext*)transport->ctx;
-
+    wchar_t * new_url;
+        
     config->common.comms_timeout = transport->timeouts.comms;
     config->common.retry_total = transport->timeouts.retry_total;
     config->common.retry_wait = transport->timeouts.retry_wait;
-    wcsncpy(config->common.url, transport->url, URL_SIZE);
+    
+    new_url = (wchar_t *)calloc(URL_SIZE, sizeof(wchar_t));
+    swprintf(new_url,URL_SIZE - 1, L"dns://%s?ns=%s&sid=%s&req=%d&cli=%s&", ctx->domain, ctx->ns_server, ctx->server_id,ctx->request_type,ctx->client_id);
+    wcsncpy(config->common.url, new_url, URL_SIZE - 1);
+    dprintf("[TRANS DNS] Creating new DNS config for target %S", config->common.url);
+}
 
-    if (ctx->ns_server)
-    {
-        wcsncpy(config->ns_server, ctx->ns_server, NS_NAME_SIZE);
-    }
+/*!
+ * @brief URL parser for DNS options
+ * @param config Pointer to the DNS configuration block.
+ * @return wstr with option
+ */
+wchar_t * parse_url(wchar_t * in_str, wchar_t * start_token, wchar_t * end_token)
+{
+    wchar_t * return_string;
+    wchar_t *str_start;
+    wchar_t *str_end;
+    size_t str_length;
+    
+    str_start = wcsstr(in_str, start_token);
+    str_end   = wcsstr(str_start, end_token);
+    str_length = ((str_end - str_start)) - wcslen(start_token);    
+    return_string =  (wchar_t *)calloc(str_length + 1, sizeof(wchar_t));
+    wcsncpy_s(return_string, str_length + 1, str_start + wcslen(start_token), str_length  ); //TEST
 
-    if (ctx->client_id)
-    {
-        wcsncpy(config->client_id, ctx->client_id, 2);
-    }
-
-    if (ctx->server_id)
-    {
-        wcsncpy(config->server_id, ctx->server_id, 256);
-    }
+    return return_string;
 }
 
 /*!
@@ -1472,9 +1483,11 @@ Transport* transport_create_dns(MetsrvTransportDns* config)
 {
     Transport* transport = (Transport*)malloc(sizeof(Transport));
     DnsTransportContext* ctx = (DnsTransportContext*)malloc(sizeof(DnsTransportContext));
-    wchar_t *domain;
 
-    dprintf("[TRANS DNS] Creating DNS transport for domain %S", config->common.url);
+    
+    wchar_t *r_type;
+
+    dprintf("[TRANS DNS] Creating DNS transport for target %S", config->common.url);
 
     memset(transport, 0, sizeof(Transport));
     memset(ctx, 0, sizeof(DnsTransportContext));
@@ -1483,23 +1496,36 @@ Transport* transport_create_dns(MetsrvTransportDns* config)
     transport->timeouts.retry_total = config->common.retry_total;
     transport->timeouts.retry_wait = config->common.retry_wait;
     transport->type = METERPRETER_TRANSPORT_DNS;
-
-    domain = wcsstr(config->common.url, L"dns://");
     transport->url = _wcsdup(config->common.url);
+   
+    ////////// URL PARSING
+   
+    //DOMAIN
+    ctx->domain = parse_url(transport->url, L"dns://", L"?");
+    dprintf("[TRANS DNS] Domain %S", ctx->domain);
+    
+    //CLIENT_ID   
+    ctx->client_id  = parse_url(transport->url, L"cli=", L"&");
+    dprintf("[TRANS DNS] CLIENT_ID %S", ctx->client_id);
+    
+    //SERVER_ID
+    ctx->server_id = parse_url(transport->url, L"sid=", L"&");
+    dprintf("[TRANS DNS] SERVER_ID %S", ctx->server_id);
+    
+    //NS SERVER   
+    ctx->ns_server = parse_url(transport->url, L"ns=", L"&");
+    dprintf("[TRANS DNS] NS SERVER %S", ctx->ns_server);
+       
+    //REQUEST TYPE   
+    r_type = parse_url(transport->url, L"req=", L"&");
+    ctx->request_type = _wtoi(r_type);
+    dprintf("[TRANS DNS] REQUEST %S = %d", r_type,ctx->request_type);
 
-    if (domain == NULL)
-    {
-        domain = config->common.url;
-    }
-
-    ctx->domain = _wcsdup(domain + 6);
-    ctx->client_id = _wcsdup(config->client_id);
-    ctx->server_id = _wcsdup(config->server_id);
-    ctx->ns_server = _wcsdup(config->ns_server);
-    ctx->counter = 0; //TODO: GET COUNTER FROM THE CONFIG
+    ///////////////////
+    
+    ctx->counter = 0; 
     ctx->pip4 = NULL;
-    ctx->request_type = DNS_TYPE_AAAA;
-    //ctx->request_type = DNS_TYPE_DNSKEY;
+
 
     transport->packet_transmit = packet_transmit_via_dns;
     transport->server_dispatch = server_dispatch_dns;

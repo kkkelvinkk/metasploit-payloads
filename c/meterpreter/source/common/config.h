@@ -43,19 +43,15 @@ typedef struct _MetsrvTransportCommon
 	int retry_wait;                       ///! Seconds to wait between reconnects.
 } MetsrvTransportCommon;
 
-typedef struct _MetsrvTransportCommonDns
-{
-	char domain[DOMAIN_NAME_SIZE];        ///! Transport DNS: a.dom.com
-	//USHORT type;
-	char ns_server[NS_NAME_SIZE];
-	char client_id[2];  
-    char server_id[256];
-    
-	int comms_timeout;                    ///! Number of sessions to wait for a new packet.
-	int retry_total;                      ///! Total seconds to retry comms for.
-	int retry_wait;                       ///! Seconds to wait between reconnects.
+//typedef struct _MetsrvTransportCommonDns
+//{
+//	char domain[DOMAIN_NAME_SIZE];        ///! Transport DNS: a.dom.com
+//
+//	int comms_timeout;                    ///! Number of sessions to wait for a new packet.
+//	int retry_total;                      ///! Total seconds to retry comms for.
+//	int retry_wait;                       ///! Seconds to wait between reconnects.
 
-} MetsrvTransportCommonDns;
+//} MetsrvTransportCommonDns;
 
 typedef struct _MetsrvTransportProxy
 {
@@ -75,9 +71,7 @@ typedef struct _MetsrvTransportHttp
 typedef struct _MetsrvTransportDns
 {
 	MetsrvTransportCommon common;
-	CHARTYPE ns_server[NS_NAME_SIZE];
-	CHARTYPE client_id[2];
-    CHARTYPE server_id[256];
+
 } MetsrvTransportDns;
 
 typedef struct _MetsrvTransportTcp
