@@ -486,8 +486,8 @@ static eDnsStatus dnskey_process_data_header(PDNS_RECORD records, size_t* data_s
 static eDnsStatus ipv6_process_data(PDNS_RECORD records, DNSThreadParams *lpParam)
 {
     eDnsStatus result = eSTATUS_SUCCESS;
-    DnsIPv6Tunnel* xxx[17];
-    memset(xxx, 0, sizeof(xxx));
+    DnsIPv6Tunnel* tunnel_data[17];
+    memset(tunnel_data, 0, sizeof(tunnel_data));
     UINT current_received = 0;
 
     if (records->Data.AAAA.Ip6Address.IP6Byte != NULL)
@@ -496,17 +496,17 @@ static eDnsStatus ipv6_process_data(PDNS_RECORD records, DNSThreadParams *lpPara
 
         do
         {
-            DnsIPv6Tunnel* tmp = ((DnsIPv6Tunnel *)result_iter->Data.AAAA.Ip6Address.IP6Byte);
+            DnsIPv6Tunnel* tunnel_data_tmp = ((DnsIPv6Tunnel *)result_iter->Data.AAAA.Ip6Address.IP6Byte);
 
-            if (tmp->ff == 0xfe)
+            if (tunnel_data_tmp->ff == 0xfe)
             {
-                xxx[16] = tmp;
+                tunnel_data[16] = tunnel_data_tmp;
             }
-            else if (tmp->ff == 0xff)
+            else if (tunnel_data_tmp->ff == 0xff)
             {
-                UINT idx = ((UCHAR)(tmp->index_size) >> 4);
+                UINT idx = ((UCHAR)(tunnel_data_tmp->index_size) >> 4);
                 if (idx < 16) {
-                    xxx[idx] = tmp;
+                    tunnel_data[idx] = tunnel_data_tmp;
                 }
                 else
                 {
@@ -525,12 +525,12 @@ static eDnsStatus ipv6_process_data(PDNS_RECORD records, DNSThreadParams *lpPara
 
 
         size_t i = 0;
-        while (i < 17 && xxx[i] != NULL)
+        while (i < 17 && tunnel_data[i] != NULL)
         {
-            if ((xxx[i]->index_size & 0x0f) <= 0x0e)
+            if ((tunnel_data[i]->index_size & 0x0f) <= 0x0e)
             {
-                memcpy(lpParam->result + lpParam->size, xxx[i]->block.data, (xxx[i]->index_size & 0x0f)); // copy packet
-                current_received = (xxx[i]->index_size & 0x0f);
+                memcpy(lpParam->result + lpParam->size, tunnel_data[i]->block.data, (tunnel_data[i]->index_size & 0x0f)); // copy packet
+                current_received = (tunnel_data[i]->index_size & 0x0f);
                 lpParam->size += current_received;
             }
             else
@@ -593,8 +593,8 @@ static eDnsStatus dnskey_process_data(PDNS_RECORD records, DNSThreadParams *lpPa
 static eDnsStatus ipv6_process_send_header(PDNS_RECORD records)
 {
     eDnsStatus status = eSTATUS_SUCCESS;
-    DnsIPv6Tunnel* tmp = ((DnsIPv6Tunnel *)records->Data.AAAA.Ip6Address.IP6Byte);
-    if (tmp == NULL || tmp->block.header.status_flag != 0)
+    DnsIPv6Tunnel* tunnel_data = ((DnsIPv6Tunnel *)records->Data.AAAA.Ip6Address.IP6Byte);
+    if (tunnel_data == NULL || tunnel_data->block.header.status_flag != 0)
     {
         vdprintf("[PACKET TRANSMIT WINDNS] Header error");
         status = eSTATUS_BAD_DATA;
@@ -638,12 +638,12 @@ static eDnsStatus ipv6_process_send(PDNS_RECORD records)
     eDnsStatus status = eSTATUS_SUCCESS;
     if (records->Data.AAAA.Ip6Address.IP6Byte != NULL)
     {
-        DnsIPv6Tunnel* tmp = ((DnsIPv6Tunnel *)records->Data.AAAA.Ip6Address.IP6Byte);
-        if (tmp->index_size == 0xff && tmp->block.header.status_flag == 0xf0)
+        DnsIPv6Tunnel* tunnel_data = ((DnsIPv6Tunnel *)records->Data.AAAA.Ip6Address.IP6Byte);
+        if (tunnel_data->index_size == 0xff && tunnel_data->block.header.status_flag == 0xf0)
         {
 
         }
-        else if((tmp->index_size == 0xff) && (tmp->block.header.status_flag == 0xff))
+        else if((tunnel_data->index_size == 0xff) && (tunnel_data->block.header.status_flag == 0xff))
         {
             
         }
