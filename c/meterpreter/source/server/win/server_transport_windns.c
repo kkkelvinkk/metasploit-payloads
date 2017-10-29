@@ -1272,7 +1272,7 @@ static DWORD packet_receive_dns(Remote *remote, Packet **packet)
 
         if (rcvStatus == TRUE) // Handle response
         {
-            vdprintf("[PACKET RECEIVE DNS] Registred. New CLIENT ID: '%s'", ctx->client_id);
+            vdprintf("[PACKET RECEIVE DNS] Registred. New CLIENT ID: '%S'", ctx->client_id);
             SetLastError(DNS_INFO_NO_RECORDS);
             res = DNS_INFO_NO_RECORDS;
         }
