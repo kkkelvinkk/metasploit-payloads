@@ -1091,7 +1091,7 @@ class MSFClient(object):
         with self.lock:
             if not self.client:
                 if self._setup_client():
-                    self._setup_tlv_reader()
+                    self._setup_status_request_reader()
                     Registrator.instance().unsubscribe(self.msf_id, self)
                     self.wait_client = False
                     self.polling()
@@ -1126,6 +1126,12 @@ class MSFClient(object):
                                               completion_func=self._read_stage_complete_data_drop if without_data else
                                                               self._read_stage_complete
                                               )
+    
+    def _setup_status_request_reader(self):
+        self.parted_reader = PartedDataReader(read_func=self._read_data,
+                                              header_func=self._read_status_request,
+                                              completion_func=self._read_status_complete
+                                              )
 
     def _read_id_header(self):
         id_size_byte = self._read_data(1)
@@ -1135,17 +1141,12 @@ class MSFClient(object):
     def _read_id_complete(self, data):
         MSFClient.LOGGER.info("Id read is done")
         self.msf_id = data.get_data()
-
-        if Registrator.instance().is_stager_server(self.msf_id):
-            MSFClient.LOGGER.info("Stager has already read for this server id(%s). Continue.", self.msf_id)
-            # MSFClient.LOGGER.info("Start reading stage without sending to client")
-            #self._setup_stage_reader(without_data=True)
-
         if self._setup_client():
-            MSFClient.LOGGER.info("Client is found.Setup tlv reader.")
-            self._setup_tlv_reader()
+            MSFClient.LOGGER.info("New client is found.")
+            self._setup_status_request_reader()
         else:
-            MSFClient.LOGGER.info("There are no clients for server id %s. Create subscription", self.msf_id)
+            MSFClient.LOGGER.info("There are no clients for server id %s. Create subscription",
+                                  self.msf_id)
             Registrator.instance().subscribe(self.msf_id, self)
             self.parted_reader = None
             self.wait_client = True
@@ -1160,8 +1161,27 @@ class MSFClient(object):
     def _read_stage_complete(self, data):
         MSFClient.LOGGER.info("Stage read is done")
         Registrator.instance().add_stager_for_server(self.msf_id, data.get_data())
-        self.parted_reader = None
-        self.wait_client = True
+        self._setup_status_request_reader()
+
+    def _read_status_request(self):
+        MSFClient.LOGGER.info("Start reading status request")
+        data_size = 1
+        return data_size, None
+
+    def _read_status_complete(self, data):
+        MSFClient.LOGGER.info("Status request is read")
+        if self.client:
+            MSFClient.LOGGER.debug("Client is exists, send true")
+            self.sock.send("\x01")
+            self._setup_tlv_reader()
+        elif self._setup_client():
+            MSFClient.LOGGER.debug("New client is found, send true")
+            self.sock.send("\x01")
+            self._setup_tlv_reader()
+            self.wait_client = False
+        else:
+            MSFClient.LOGGER.debug("There are no clients, send false")
+            self.sock.send("\x00")
 
     def _read_stage_complete_data_drop(self, data):
         MSFClient.LOGGER.info("Stage read is done. Drop data and continue.")
