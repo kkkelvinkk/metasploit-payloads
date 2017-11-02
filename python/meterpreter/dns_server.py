@@ -326,6 +326,7 @@ class Registrator(object):
         self.servers = {}
         self.stagers = {}
         self.waited_servers = {}
+        self.unregister_list = []
         self.lock = threading.Lock()
         self.logger = logging.getLogger(self.__class__.__name__)
         self.default_stager = StageClient()
@@ -420,10 +421,8 @@ class Registrator(object):
 
     def unregister_client(self, client_id, pending=True):
         if pending:
-            def unregister_callback(cur_time):
-                self._unregister_client(client_id)
-
-            self.timeout_service.add_callback(unregister_callback, True)
+            with self.lock:
+                self.unregister_list.append(client_id)
         else:
             self._unregister_client(client_id)
 
@@ -450,6 +449,19 @@ class Registrator(object):
                     del self.stagers[server_id]
                     self.logger.info("Clearing stager client for server with '%s' id(reason: timeout)", server_id)
 
+            unregister_list = []
+            for client_id in self.unregister_list:
+                client = self.clientMap.get(client_id, None)
+                if client:
+                    if client.is_idle():
+                        del self.clientMap[client_id]
+                        self.id_list.append(client_id)
+                        self.logger.info("Unregister client with '%s' id", client_id)
+                    else:
+                        unregister_list.append(client_id)
+
+            self.unregister_list = unregister_list
+                    
         for client in disconnect_client_lst:
             if client.server_id:
                 clients = self.servers.get(client.server_id, [])
@@ -526,9 +538,16 @@ class Client(object):
         self.server_id = None
         self.register_for_server_needed = False
         self.ts = 0
+        self.lock = threading.Lock()
 
     def update_last_request_ts(self):
         self.ts = int(time.time())
+
+    def is_idle(self):
+        with self.lock:
+            # msf sends 2 packets after exit packet, but client doesn't request it
+            # self.client_queue.empty() and \ 
+            return not self.server and not self.received_data.is_complete() 
 
     def register_client(self, server_id, encoder):
         client_id = Registrator.instance().request_client_id(self)
@@ -558,7 +577,8 @@ class Client(object):
         self.padding = 0
 
     def set_server(self, server):
-        self.server = server
+        with self.lock:
+            self.server = server
 
     def incoming_data_header(self, data_size, padding, encoder):
         if self.received_data.get_expected_size() == data_size and self.state == self.INCOMING_DATA:
