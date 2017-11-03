@@ -337,6 +337,7 @@ class Registrator(object):
         self.timeout_service.remove_callback(self.on_timeout)
 
     def register_client_for_server(self, server_id, client):
+        self.logger.info("Register client(%s) for server '%s'", client.get_id(), server_id)
         with self.lock:
             self.servers.setdefault(server_id, []).append(client)
         self._notify_waited_servers(server_id)
@@ -361,6 +362,7 @@ class Registrator(object):
                 if not waited_lst:
                     del self.waited_servers[server_id]
         if notify_server:
+            self.logger.info("Notify server(%s)", notify_server)
             notify_server.on_new_client()
 
     def subscribe(self, server_id, server):
@@ -382,6 +384,7 @@ class Registrator(object):
                 return self.clientMap[client_id]
 
     def get_new_client_for_server(self, server_id):
+        self.logger.info("Looking for clients...")
         with self.lock:
             with ignored(IndexError):
                 clients = self.servers.get(server_id, [])
@@ -649,7 +652,7 @@ class Client(object):
                 sub_domain = next_sub
                 data_size = self.send_data.get_size()
             else:
-                self.logger.info("No data for client.")
+                self.logger.info("No data for client.(%s)", "server" if self.server else "no server")
             self.logger.info("Send data header to client with domain %s and size %d", sub_domain, data_size)
             return encoder.encode_data_header(sub_domain, data_size)
         else:
@@ -1006,19 +1009,25 @@ class PartedDataReader(object):
     INITIAL = 1
     RECEIVING_DATA = 2
 
-    def __init__(self, read_func, header_func=None, completion_func=None, continue_func=None):
+    def __init__(self, read_func, header_func=None, completion_func=None,
+                 continue_func=None, init_data=None):
         self.read_func = read_func
         self.header_func = header_func
         self.completion_func = completion_func
         self.continue_func = continue_func
         self.state = PartedDataReader.INITIAL
-        self.data = None
+        self.header = ""
+        self.data = init_data
 
     def read(self):
         if self.state == PartedDataReader.INITIAL:
-            data_size, data = self.header_func()
+            data_size, data = self.header_func(self.header)
             if data_size == 0:
                 return
+            elif data_size == -1:
+                self.header = data
+                return
+            self.header = ""
             self.state = PartedDataReader.RECEIVING_DATA
             self.data = PartedData(data_size)
             if data:
@@ -1054,6 +1063,7 @@ class MSFClient(object):
         self.wait_client = False
         self.stage_requested = False
         self.lock = threading.Lock()
+        self.client_event = threading.Event()
         self.parted_reader = None
         self._setup_id_reader()
 
@@ -1133,10 +1143,13 @@ class MSFClient(object):
                                               completion_func=self._read_status_complete
                                               )
 
-    def _read_id_header(self):
+    def _read_id_header(self, data):
         id_size_byte = self._read_data(1)
-        id_size = struct.unpack("B", id_size_byte)[0]
-        return id_size, None
+        if id_size_byte and len(id_size_byte) == 1:
+            id_size = struct.unpack("B", id_size_byte)[0]
+            return id_size, None
+        else:
+            return 0, None
 
     def _read_id_complete(self, data):
         MSFClient.LOGGER.info("Id read is done")
@@ -1147,23 +1160,26 @@ class MSFClient(object):
         else:
             MSFClient.LOGGER.info("There are no clients for server id %s. Create subscription",
                                   self.msf_id)
-            Registrator.instance().subscribe(self.msf_id, self)
             self.parted_reader = None
             self.wait_client = True
+            Registrator.instance().subscribe(self.msf_id, self)
 
-    def _read_stage_header(self):
+    def _read_stage_header(self, data):
         MSFClient.LOGGER.info("Start reading stager")
         data_size_b = self._read_data(4)
-        data_size = struct.unpack("<I", data_size_b)[0]
-        MSFClient.LOGGER.info("Stager size is %d bytes", data_size)
-        return data_size+4, data_size_b
+        if data_size_b and len(data_size_b) == 4:
+            data_size = struct.unpack("<I", data_size_b)[0]
+            MSFClient.LOGGER.info("Stager size is %d bytes", data_size)
+            return data_size+4, data_size_b
+        else:
+            return 0, None
 
     def _read_stage_complete(self, data):
         MSFClient.LOGGER.info("Stage read is done")
         Registrator.instance().add_stager_for_server(self.msf_id, data.get_data())
         self._setup_status_request_reader()
 
-    def _read_status_request(self):
+    def _read_status_request(self, data):
         MSFClient.LOGGER.info("Start reading status request")
         data_size = 1
         return data_size, None
@@ -1171,16 +1187,16 @@ class MSFClient(object):
     def _read_status_complete(self, data):
         MSFClient.LOGGER.info("Status request is read")
         if self.client:
-            MSFClient.LOGGER.debug("Client is exists, send true")
+            MSFClient.LOGGER.info("Client is exists, send true")
             self.sock.send("\x01")
             self._setup_tlv_reader()
         elif self._setup_client():
-            MSFClient.LOGGER.debug("New client is found, send true")
+            MSFClient.LOGGER.info("New client is found, send true")
             self.sock.send("\x01")
             self._setup_tlv_reader()
             self.wait_client = False
         else:
-            MSFClient.LOGGER.debug("There are no clients, send false")
+            MSFClient.LOGGER.info("There are no clients, send false")
             self.sock.send("\x00")
 
     def _read_stage_complete_data_drop(self, data):
@@ -1190,19 +1206,22 @@ class MSFClient(object):
             self._setup_tlv_reader()
         else:
             MSFClient.LOGGER.info("There are no clients for server id %s. Create subscription", self.msf_id)
-            Registrator.instance().subscribe(self.msf_id, self)
             self.parted_reader = None
             self.wait_client = True
+            Registrator.instance().subscribe(self.msf_id, self)
 
-    def _read_tlv_header(self):
-        header = self._read_data(MSFClient.HEADER_SIZE)
+    def _read_tlv_header(self, data):
+        header = self._read_data(MSFClient.HEADER_SIZE - len(data))
         if not header:
             return 0, None
 
+        header = data + header
         if len(header) != MSFClient.HEADER_SIZE:
-            MSFClient.LOGGER.error("Can't read full header)")
-            return 0, None
+            MSFClient.LOGGER.info("Can't read full header(%s - %d)", self.sock, len(header))
+            return -1, header
 
+        if len(data) != 0:
+            MSFClient.LOGGER.info("Full header is read succesfully(%s)", self.sock)
         MSFClient.LOGGER.debug("PARSE HEADER")
         xor_key = header[:4]
         pkt_length_binary = xor_bytes(xor_key, header[24:28])
@@ -1223,12 +1242,14 @@ class MSFClient(object):
         :return: True if client is found and False otherwise
         """
         if not self.msf_id:
+            MSFClient.LOGGER.error("There are no msf id!!!")
             return False
         client = Registrator.instance().get_new_client_for_server(self.msf_id)
         if client:
             self.client = client
             client.set_server(self)
-            MSFClient.LOGGER.info("Association client-server is done successfully")
+            MSFClient.LOGGER.info("Association client-server is done successfully(%s(%s)<->%s)",
+                                   self.msf_id, str(self), self.client.get_id())
             return True
         return False
 
