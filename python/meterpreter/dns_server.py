@@ -1,6 +1,11 @@
 #!/usr/bin/env python
 # coding=utf-8
 
+# MSF Bridge for reverse_dns transport
+#
+# Authors: Maxim Andreyanov, Alexey Sintsov
+#
+
 import argparse
 import sys
 import time
