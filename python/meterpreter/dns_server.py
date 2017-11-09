@@ -813,7 +813,7 @@ class GetStageRequest(Request):
 
 
 class IncomingDataRequest(Request):
-    EXPR = re.compile(r"t\.(?P<base64>.*)\.(?P<idx>\d+)\.(?P<cnt>\d+)\.(?P<client>\w)")
+    EXPR = re.compile(r"tx\.(?P<base64>.*)\.(?P<idx>\d+)\.(?P<cnt>\d+)\.(?P<client>\w)")
 
     @classmethod
     def _handle_client(cls, client, **kwargs):

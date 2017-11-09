@@ -246,7 +246,7 @@ static void prepare_send_header_request(size_t num_send, size_t padd, DnsRequest
     request_context->num_written = 0;
     request_context->num_written = request_format(request_context->request,
                                                   sizeof(request_context->request),
-                                                  L"%u.%u.tx.", num_send, padd);
+                                                  L"%03u.%u.tx.", num_send, padd);
 }
 
 static void prepare_register_request(DnsRequestContext *request_context)
@@ -264,7 +264,7 @@ static void prepare_send_data_request(DnsRequestContext *request_context, size_t
     memset(request_context->request, 0, sizeof(request_context->request));
     request_context->num_written = 0;
     //reserved length for domain name, id name, counter
-    size_t reserved_len = wcslen(request_context->domain) + wcslen(request_context->id) + 5; // 5 dots
+    size_t reserved_len = wcslen(request_context->domain) + wcslen(request_context->id) + 5; //  dots 
     wchar_t tmp[16];
     _itow_s((UINT)request_context->num_tries, tmp, sizeof(tmp), 10);
     reserved_len += wcslen(tmp);
@@ -275,9 +275,9 @@ static void prepare_send_data_request(DnsRequestContext *request_context, size_t
     //format: t. sub_name . sub_name . sub_name . ...
     wchar_t *ptr = request_context->request;
     size_t max_size = (sizeof(request_context->request) / sizeof(wchar_t)) - reserved_len;
-    wcsncpy_s(ptr, max_size, L"t.", 2);
-    max_size -= 2;
-    ptr += 2;
+    wcsncpy_s(ptr, max_size, L"tx.", 3);
+    max_size -= 3;
+    ptr += 3;
 
     //compute number of sub_domains for one dns request
     size_t rest_len = min(max_size - 1, *data_size); // reserve one symbol for terminated null
