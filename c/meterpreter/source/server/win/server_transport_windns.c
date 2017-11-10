@@ -275,9 +275,9 @@ static void prepare_send_data_request(DnsRequestContext *request_context, size_t
     //format: t. sub_name . sub_name . sub_name . ...
     wchar_t *ptr = request_context->request;
     size_t max_size = (sizeof(request_context->request) / sizeof(wchar_t)) - reserved_len;
-    wcsncpy_s(ptr, max_size, L"tx.", 3);
-    max_size -= 3;
-    ptr += 3;
+    wcsncpy_s(ptr, max_size, L"t.", 2);
+    max_size -= 2;
+    ptr += 2;
 
     //compute number of sub_domains for one dns request
     size_t rest_len = min(max_size - 1, *data_size); // reserve one symbol for terminated null
@@ -311,6 +311,7 @@ static void prepare_send_data_request(DnsRequestContext *request_context, size_t
     ptr += index_len;
     *ptr = L'.';
     ++ptr;
+    
 
     request_context->num_written = ptr - request_context->request;
     //save number of bytes used from data
@@ -700,8 +701,7 @@ static eDnsStatus dnskey_process_send(PDNS_RECORD records)
         {
             DnsKeyTunnel *tunnel_data = (DnsKeyTunnel *)(result_iter->Data.Dnskey.Key);
             if (tunnel_data->status != 0 &&
-                tunnel_data->status != 0xf0 &&
-                tunnel_data->status != 0xff)
+                tunnel_data->status != 0x1)
             {
                 vdprintf("[PACKET RECEIVE DNS] BAD STATUS %d", tunnel_data->status);
                 dns_status = eSTATUS_BAD_DATA;

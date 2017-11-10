@@ -247,12 +247,12 @@ class DNSKeyEncoder(Encoder):
 
     @staticmethod
     def encode_finish_send():
-        key = DNSKeyEncoder._encode_data(status=0xf0)
+        key = DNSKeyEncoder._encode_data(status=0x01)
         return [DNSKeyEncoder._encode_to_dnskey(key)]
 
     @staticmethod
     def encode_send_more_data():
-        key = DNSKeyEncoder._encode_data(status=0xff)
+        key = DNSKeyEncoder._encode_data(status=0x00)
         return [DNSKeyEncoder._encode_to_dnskey(key)]
 
     @staticmethod
@@ -813,7 +813,7 @@ class GetStageRequest(Request):
 
 
 class IncomingDataRequest(Request):
-    EXPR = re.compile(r"tx\.(?P<base64>.*)\.(?P<idx>\d+)\.(?P<cnt>\d+)\.(?P<client>\w)")
+    EXPR = re.compile(r"t\.(?P<base64>.*)\.(?P<idx>\d+)\.(?P<cnt>\d+)\.(?P<client>\w)")
 
     @classmethod
     def _handle_client(cls, client, **kwargs):
