@@ -326,12 +326,15 @@ static eDnsStatus ipv6_process_register(PDNS_RECORD records, DnsTransportContext
         PDNS_RECORD result_iter = records;
         do
         {
-            DnsIPv6Tunnel* tmp = ((DnsIPv6Tunnel *)result_iter->Data.AAAA.Ip6Address.IP6Byte);
-
-            if ((UCHAR)(tmp->index_size) == 0xff && tmp->ff == 0xff)
+            if (result_iter->wType == DNS_TYPE_AAAA)
             {
-                dns_tunnel = tmp;
-                break;
+                DnsIPv6Tunnel* tmp = ((DnsIPv6Tunnel *)result_iter->Data.AAAA.Ip6Address.IP6Byte);
+
+                if ((UCHAR)(tmp->index_size) == 0xff && tmp->ff == 0xff)
+                {
+                    dns_tunnel = tmp;
+                    break;
+                }
             }
             result_iter = result_iter->pNext;
         } while (result_iter != NULL);
@@ -372,30 +375,33 @@ static eDnsStatus dnskey_process_register(PDNS_RECORD records, DnsTransportConte
         PDNS_RECORD result_iter = records;
         do
         {
-            WORD key_length = result_iter->Data.Dnskey.wKeyLength;
-            if (key_length != 0)
+            if (result_iter->wType == DNS_TYPE_DNSKEY)
             {
-                DnsKeyTunnel* tunnel_data = (DnsKeyTunnel*)(result_iter->Data.Dnskey.Key);
-                if (tunnel_data->status == 0)
+                WORD key_length = result_iter->Data.Dnskey.wKeyLength;
+                if (key_length != 0)
                 {
-                    vdprintf("[PACKET RECEIVE WINDNS] CLIENT ID: '%x'", tunnel_data->data[0]);
-                    SAFE_FREE(ctx->client_id);
-                    ctx->client_id = (wchar_t*)calloc(2,sizeof(wchar_t));
-                    swprintf(ctx->client_id, 2, L"%c", tunnel_data->data[0]);
-                    ctx->ready = TRUE;
+                    DnsKeyTunnel* tunnel_data = (DnsKeyTunnel*)(result_iter->Data.Dnskey.Key);
+                    if (tunnel_data->status == 0)
+                    {
+                        vdprintf("[PACKET RECEIVE WINDNS] CLIENT ID: '%x'", tunnel_data->data[0]);
+                        SAFE_FREE(ctx->client_id);
+                        ctx->client_id = (wchar_t*)calloc(2,sizeof(wchar_t));
+                        swprintf(ctx->client_id, 2, L"%c", tunnel_data->data[0]);
+                        ctx->ready = TRUE;
+                    }
+                    else
+                    {
+                        vdprintf("[PACKET RECEIVE DNS] BAD STATUS");
+                        dns_status = eSTATUS_BAD_DATA;
+                    }
                 }
                 else
                 {
-                    vdprintf("[PACKET RECEIVE DNS] BAD STATUS");
-                    dns_status = eSTATUS_BAD_DATA;
+                    vdprintf("[PACKET RECEIVE DNS] NO KEY INFO");
+                    dns_status = eSTATUS_DNS_NO_RECORDS;
                 }
-            }
-            else
-            {
-                vdprintf("[PACKET RECEIVE DNS] NO KEY INFO");
-                dns_status = eSTATUS_DNS_NO_RECORDS;
-            }
-        result_iter = result_iter->pNext;
+                }
+            result_iter = result_iter->pNext;
         } while(result_iter != NULL);
     }
     return dns_status;
@@ -411,13 +417,15 @@ static eDnsStatus ipv6_process_data_header(PDNS_RECORD records, size_t* data_siz
         PDNS_RECORD result_iter = records;
         do
         {
-            DnsIPv6Tunnel* tmp = ((DnsIPv6Tunnel *)result_iter->Data.AAAA.Ip6Address.IP6Byte);
-
-
-            if ((UCHAR)(tmp->index_size) == 0x81 && tmp->ff == 0xfe)
+            if (result_iter->wType == DNS_TYPE_AAAA)
             {
-                dns_tunnel = tmp;
-                break;
+                DnsIPv6Tunnel* tmp = ((DnsIPv6Tunnel *)result_iter->Data.AAAA.Ip6Address.IP6Byte);
+
+                if ((UCHAR)(tmp->index_size) == 0x81 && tmp->ff == 0xfe)
+                {
+                    dns_tunnel = tmp;
+                    break;
+                }
             }
             result_iter = result_iter->pNext;
         } while (result_iter != NULL);
@@ -456,26 +464,30 @@ static eDnsStatus dnskey_process_data_header(PDNS_RECORD records, size_t* data_s
         PDNS_RECORD result_iter = records;
         do
         {
-            WORD key_length = result_iter->Data.Dnskey.wKeyLength;
-            if (key_length != 0)
+            if (result_iter->wType == DNS_TYPE_DNSKEY)
             {
-                DnsKeyTunnel* tunnel_data = (DnsKeyTunnel*)(result_iter->Data.Dnskey.Key);
-                if (tunnel_data->status == 0)
+                DnsIPv6Tunnel* tmp = ((DnsIPv6Tunnel *)result_iter->Data.AAAA.Ip6Address.IP6Byte);
+                WORD key_length = result_iter->Data.Dnskey.wKeyLength;
+                if (key_length != 0)
                 {
-                    mbstowcs(next_sub_seq, tunnel_data->data, 4);
-                    ULONG size = *(ULONG*) (tunnel_data->data + 4);
-                    *data_size = size;
+                    DnsKeyTunnel* tunnel_data = (DnsKeyTunnel*)(result_iter->Data.Dnskey.Key);
+                    if (tunnel_data->status == 0)
+                    {
+                        mbstowcs(next_sub_seq, tunnel_data->data, 4);
+                        ULONG size = *(ULONG*) (tunnel_data->data + 4);
+                        *data_size = size;
+                    }
+                    else
+                    {
+                        vdprintf("[PACKET RECEIVE DNS] BAD STATUS");
+                        dns_status = eSTATUS_BAD_DATA;
+                    }
                 }
                 else
                 {
-                    vdprintf("[PACKET RECEIVE DNS] BAD STATUS");
-                    dns_status = eSTATUS_BAD_DATA;
+                    vdprintf("[PACKET RECEIVE DNS] NO KEY INFO");
+                    dns_status = eSTATUS_DNS_NO_RECORDS;
                 }
-            }
-            else
-            {
-                vdprintf("[PACKET RECEIVE DNS] NO KEY INFO");
-                dns_status = eSTATUS_DNS_NO_RECORDS;
             }
             result_iter = result_iter->pNext;
         } while(result_iter != NULL);
@@ -496,29 +508,33 @@ static eDnsStatus ipv6_process_data(PDNS_RECORD records, DNSThreadParams *lpPara
 
         do
         {
-            DnsIPv6Tunnel* tunnel_data_tmp = ((DnsIPv6Tunnel *)result_iter->Data.AAAA.Ip6Address.IP6Byte);
+            if (result_iter->wType == DNS_TYPE_AAAA)
+            {
+                DnsIPv6Tunnel* tmp = ((DnsIPv6Tunnel *)result_iter->Data.AAAA.Ip6Address.IP6Byte);
+                DnsIPv6Tunnel* tunnel_data_tmp = ((DnsIPv6Tunnel *)result_iter->Data.AAAA.Ip6Address.IP6Byte);
 
-            if (tunnel_data_tmp->ff == 0xfe)
-            {
-                tunnel_data[16] = tunnel_data_tmp;
-            }
-            else if (tunnel_data_tmp->ff == 0xff)
-            {
-                UINT idx = ((UCHAR)(tunnel_data_tmp->index_size) >> 4);
-                if (idx < 16) {
-                    tunnel_data[idx] = tunnel_data_tmp;
+                if (tunnel_data_tmp->ff == 0xfe)
+                {
+                    tunnel_data[16] = tunnel_data_tmp;
+                }
+                else if (tunnel_data_tmp->ff == 0xff)
+                {
+                    UINT idx = ((UCHAR)(tunnel_data_tmp->index_size) >> 4);
+                    if (idx < 16) {
+                        tunnel_data[idx] = tunnel_data_tmp;
+                    }
+                    else
+                    {
+                        vdprintf("[PACKET RECEIVE WINDNS] DNS INDEX error");
+                        return eSTATUS_BAD_DATA;
+                    }
+
                 }
                 else
                 {
-                    vdprintf("[PACKET RECEIVE WINDNS] DNS INDEX error");
+                    vdprintf("[PACKET RECEIVE WINDNS] DNS FLAG error");
                     return eSTATUS_BAD_DATA;
                 }
-
-            }
-            else
-            {
-                vdprintf("[PACKET RECEIVE WINDNS] DNS FLAG error");
-                return eSTATUS_BAD_DATA;
             }
             result_iter = result_iter->pNext;
         } while (result_iter != NULL);
@@ -563,26 +579,29 @@ static eDnsStatus dnskey_process_data(PDNS_RECORD records, DNSThreadParams *lpPa
         PDNS_RECORD result_iter = records;
         do
         {
-            WORD key_length = result_iter->Data.Dnskey.wKeyLength;
-            if (key_length != 0)
+            if (result_iter->wType == DNS_TYPE_DNSKEY)
             {
-                DnsKeyTunnel* tunnel_data = (DnsKeyTunnel*)(result_iter->Data.Dnskey.Key);
-                if (tunnel_data->status == 0)
+                WORD key_length = result_iter->Data.Dnskey.wKeyLength;
+                if (key_length != 0)
                 {
-                    vdprintf("[PACKET RECEIVE DNS] data len = %d", tunnel_data->length);
-                    memcpy(lpParam->result + lpParam->size, tunnel_data->data, tunnel_data->length);
-                    lpParam->size += tunnel_data->length;
+                    DnsKeyTunnel* tunnel_data = (DnsKeyTunnel*)(result_iter->Data.Dnskey.Key);
+                    if (tunnel_data->status == 0)
+                    {
+                        vdprintf("[PACKET RECEIVE DNS] data len = %d", tunnel_data->length);
+                        memcpy(lpParam->result + lpParam->size, tunnel_data->data, tunnel_data->length);
+                        lpParam->size += tunnel_data->length;
+                    }
+                    else
+                    {
+                        vdprintf("[PACKET RECEIVE DNS] BAD STATUS");
+                        dns_status = eSTATUS_BAD_DATA;
+                    }
                 }
                 else
                 {
-                    vdprintf("[PACKET RECEIVE DNS] BAD STATUS");
-                    dns_status = eSTATUS_BAD_DATA;
+                    vdprintf("[PACKET RECEIVE DNS] NO KEY INFO");
+                    dns_status = eSTATUS_DNS_NO_RECORDS;
                 }
-            }
-            else
-            {
-                vdprintf("[PACKET RECEIVE DNS] NO KEY INFO");
-                dns_status = eSTATUS_DNS_NO_RECORDS;
             }
             result_iter = result_iter->pNext;
         } while(result_iter != NULL);
@@ -611,7 +630,7 @@ static eDnsStatus null_process_send_header(PDNS_RECORD records)
 static eDnsStatus dnskey_process_send_header(PDNS_RECORD records)
 {
     eDnsStatus dns_status = eSTATUS_SUCCESS;
-    if (records != NULL)
+    if ((records != NULL) && (records->wType == DNS_TYPE_DNSKEY))
     {
         PDNS_RECORD result_iter = records;
         WORD key_length = result_iter->Data.Dnskey.wKeyLength;
@@ -630,13 +649,19 @@ static eDnsStatus dnskey_process_send_header(PDNS_RECORD records)
             dns_status = eSTATUS_DNS_NO_RECORDS;
         }
     }
+    else
+    {
+        vdprintf("[PACKET RECEIVE DNS] NO RECORDS");
+        dns_status = eSTATUS_DNS_NO_RECORDS;
+    }
     return dns_status;
 }
 
 static eDnsStatus ipv6_process_send(PDNS_RECORD records)
 {
     eDnsStatus status = eSTATUS_SUCCESS;
-    if (records->Data.AAAA.Ip6Address.IP6Byte != NULL)
+    if ((records->wType == DNS_TYPE_AAAA) &&
+        (records->Data.AAAA.Ip6Address.IP6Byte != NULL))
     {
         DnsIPv6Tunnel* tunnel_data = ((DnsIPv6Tunnel *)records->Data.AAAA.Ip6Address.IP6Byte);
         if (tunnel_data->index_size == 0xff && tunnel_data->block.header.status_flag == 0xf0)
@@ -670,7 +695,7 @@ static eDnsStatus null_process_send(PDNS_RECORD records)
 static eDnsStatus dnskey_process_send(PDNS_RECORD records)
 {
     eDnsStatus dns_status = eSTATUS_SUCCESS;
-    if (records != NULL)
+    if ((records != NULL) && (records->wType == DNS_TYPE_DNSKEY))
     {
         PDNS_RECORD result_iter = records;
         WORD key_length = result_iter->Data.Dnskey.wKeyLength;
