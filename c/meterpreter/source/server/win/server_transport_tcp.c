@@ -425,7 +425,6 @@ static DWORD packet_receive(Remote *remote, Packet **packet)
 		memcpy_s(packetBuffer, sizeof(PacketHeader), (LPBYTE)&encodedHeader, sizeof(PacketHeader));
 
 		LPBYTE payload = packetBuffer + sizeof(PacketHeader);
-
 		// Read the payload
 		while (payloadBytesLeft > 0)
 		{
@@ -909,4 +908,3 @@ Transport* transport_create_tcp(MetsrvTransportTcp* config, LPDWORD size)
 
 	return transport;
 }
-
