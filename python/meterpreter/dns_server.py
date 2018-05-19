@@ -531,7 +531,8 @@ class Client(object):
     INITIAL = 1
     INCOMING_DATA = 2
 
-    def __init__(self):
+    def __init__(self, domain):
+        self.domain = domain
         self.state = self.INITIAL
         self.logger = logging.getLogger(self.__class__.__name__)
         # self.logger.setLevel(logging.DEBUG)
@@ -703,6 +704,9 @@ class Client(object):
             self.server.on_client_timeout()
             self.server = None
 
+    def get_domain(self):
+        return self.domain
+
 
 class StageClient(object):
     subdomain = '7812'
@@ -730,6 +734,8 @@ class StageClient(object):
         _, data = send_data.get_data(index)
         return encoder.encode_packet(data)
 
+    def get_domain(self):
+        return None
 
 class Request(object):
     EXPR = None
@@ -742,7 +748,7 @@ class Request(object):
             return cls.EXPR.match(qname)
 
     @classmethod
-    def handle(cls, qname, dns_cls):
+    def handle(cls, qname, domain, dns_cls):
         m = cls.match(qname)
         if not m:
             return None
@@ -752,12 +758,17 @@ class Request(object):
         if not client_id:
             if "new_client" in cls.OPTIONS:
                 Request.LOGGER.info("Create a new client.")
-                client = Client()
+                client = Client(domain)
         else:
             client = Registrator.instance().get_stage_client_for_server(client_id) if "stage_client" in cls.OPTIONS else \
                      Registrator.instance().get_client_by_id(client_id)
 
         if client:
+            client_domain = client.get_domain()
+            if client_domain and (client_domain != domain):
+                Request.LOGGER.info("This client registered for different domain(%s).Return.", client_domain)
+                return
+
             Request.LOGGER.info("Request will be handled by class %s", cls.__name__)
             client.update_last_request_ts()
             params["encoder"] = dns_cls.encoder
@@ -848,8 +859,7 @@ class IncomingNewClient(Request):
 class DNSTunnelRequestHandler(object):
     encoder = IPv6Encoder
 
-    def __init__(self, domain):
-        self.domain = domain
+    def __init__(self):
         self.logger = logging.getLogger(self.__class__.__name__)
         # self.logger.setLevel(logging.DEBUG)
         self.handlers_chain = [
@@ -862,90 +872,142 @@ class DNSTunnelRequestHandler(object):
             IncomingNewClient
         ]
 
-    def process_request(self, reply, qname):
-        # cut domain from requested qname
-        i = qname.rfind("." + self.domain)
-        if i == -1:
-            self.logger.error("Bad request: can't find domain %s in %s", self.domain, qname)
-            return
-        sub_domain = qname[:i]
+    def process_request(self, sub_domain, domain):
+        result = []
+        if not sub_domain:
+            self.logger.error("Bad request: subdomain is empty %s", str(sub_domain))
+            return 
+
         self.logger.info("requested subdomain name is %s", sub_domain)
         for handler in self.handlers_chain:
-            answer = handler.handle(sub_domain, self.__class__)
-            if not answer:
-                continue
-            for rr in answer:
-                self.logger.debug("Add resource record to the reply %s", rr)
-                self.process_rr(qname, rr, reply)
-            break
+            answer = handler.handle(sub_domain, domain, self.__class__)
+            if answer:
+                self.logger.debug("Request for %s is handled successfully", sub_domain)
+                result = answer
+                break
         else:
-            self.logger.error("Request with subdomain %s doesn't handled", qname)
+            self.logger.error("Request with subdomain %s doesn't handled", sub_domain)
 
-    def process_rr(self, qname, rr, reply):
-        raise NotImplementedError()
+        return result
 
 
 class AAAARequestHandler(DNSTunnelRequestHandler):
     encoder = IPv6Encoder
 
-    def process_rr(self, qname, rr, reply):
-        reply.add_answer(RR(rname=qname, rtype=QTYPE.AAAA, rclass=1, ttl=1,
-                            rdata=AAAA(rr)))
 
 class DNSKeyRequestHandler(DNSTunnelRequestHandler):
      encoder = DNSKeyEncoder
-
-     def process_rr(self, qname, rr, reply):
-         reply.add_answer(RR(rname=qname, rtype=QTYPE.DNSKEY, rclass=1, ttl=1,
-                             rdata=rr))
 
 
 class NULLRequestHandler(DNSTunnelRequestHandler):
     encoder = NULLEncoder
 
-    def process_rr(self, qname, rr, reply):
-        pass
-        # dnslib doesn't support NULL resource records
-        #reply.add_answer(RR(rname=qname, rtype=QTYPE.NULL, rclass=1, ttl=1,
-        #                    rdata=DNSNULL(rr)))
+
+class DomainDB(object):
+    A_TYPE, AAAA_TYPE, NS_TYPE, DNSKEY_TYPE = record_types = range(4)
+    static_types = [A_TYPE, NS_TYPE]
+
+    class Records(object):
+        __slots__ = 'records'
+
+        def __init__(self):
+            self.records = {}
+
+        def add(self, r_type, record):
+            self.records.setdefault(r_type, []).append(record)
+
+        def get(self, r_type):
+            return self.records.get(r_type, [])
+
+    def __init__(self, domain):
+        self.domain = domain
+        self.static_records = {}
+        self.wildcard_records = DomainDB.Records()
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.dynamic_handlers = {
+            DomainDB.AAAA_TYPE : self._get_aaaa_records,
+            DomainDB.DNSKEY_TYPE: self._get_dnskey_records
+        }
+
+        self.aaaa_handler = AAAARequestHandler()
+        self.dnskey_handler = DNSKeyRequestHandler()
+
+    def append_record(self, name, record_type, record):
+        if record_type not in self.record_types:
+            raise NotImplementedError('This record type is not supported.')
+
+        if record_type in self.static_types:
+            if name == "*":
+                self.wildcard_records.add(record_type, record)
+            else:
+                self.static_records.setdefault(name, DomainDB.Records()).add(record_type, record)
+                
+    def get_records(self, name, record_type):
+        result = []
+
+        if not name:
+            name = "@"
+
+        if record_type in self.static_types:
+            if name in self.static_records:
+                result = self.static_records[name].get(record_type)
+            else:
+                result = self.wildcard_records.get(record_type)
+        else:
+            result = self.dynamic_handlers[record_type](name)
+
+        return result
+
+    def _get_aaaa_records(self, name):
+        return self.aaaa_handler.process_request(name, self.domain)
+
+    def _get_dnskey_records(self, name):
+        return self.dnskey_handler.process_request(name, self.domain)
+
 
 class DnsServer(object):
     __instance = None
 
     @staticmethod
-    def create(domain, ipv4, ns_servers):
+    def create(domains, ipv4):
         if not DnsServer.__instance:
-            DnsServer.__instance = DnsServer(domain, ipv4, ns_servers)
+            DnsServer.__instance = DnsServer(domains, ipv4)
 
     @staticmethod
     def instance():
         return DnsServer.__instance
 
-    def __init__(self, domain, ipv4, ns_servers):
-        self.domain = domain + "."
-        self.ipv4 = ipv4
-        self.ns_servers = ns_servers
+    def __init__(self, domains, ipv4):
         self.logger = logging.getLogger(self.__class__.__name__)
+        self.domains = {}
+        for domain in domains:
+            domain += "."
+            db = DomainDB(domain)
+            db.append_record("*", DomainDB.NS_TYPE, "ns1." + domain)
+            db.append_record("*", DomainDB.NS_TYPE, "ns2." + domain)
+            db.append_record("*", DomainDB.A_TYPE, ipv4)
+            self.domains[domain] = db
+        
         self.handlers = {
             QTYPE.NS: self._process_ns_request,
             QTYPE.A: self._process_a_request,
             QTYPE.AAAA: self._process_aaaa_request,
             QTYPE.DNSKEY: self._process_dnskey_request
         }
-        self.aaaa_handler = AAAARequestHandler(self.domain)
-        self.dnskey_handler = DNSKeyRequestHandler(self.domain)
 
     def process_request(self, request, transport):
         reply = DNSRecord(DNSHeader(id=request.header.id, qr=1, aa=1, ra=1), q=request.q)
         qn = str(request.q.qname)
         qtype = request.q.qtype
         qt = QTYPE[qtype]
-        if qn.endswith(self.domain):
-            try:
-                self.logger.info("Process request for type %s", qt)
-                self.handlers[qtype](reply, qn)
-            except KeyError as e:
-                self.logger.info("%s request type is not supported", qt)
+        for domain in self.domains:
+            if qn.endswith(domain):
+                try:
+                    self.logger.info("Process request for type %s", qt)
+                    self.handlers[qtype](reply, qn, domain)
+                except KeyError as e:
+                    self.logger.info("%s request type is not supported", qt)
+                break
         else:
             self.logger.info("DNS request for domain %s is not handled by this server. Sending empty answer.", qn)
         self.logger.info("Send reply for DNS request")
@@ -957,22 +1019,34 @@ class DnsServer(object):
             answer = reply.pack()
         return answer
 
-    def _process_ns_request(self, reply, qname):
-        for server in self.ns_servers:
-            reply.add_answer(RR(rname=qname, rtype=QTYPE.NS, rclass=1, ttl=1, rdata=server))
+    def _get_subdomain(self, qname, domain):
+        sub_domain = ""
+        i = qname.rfind("." + domain)
+        if i != -1:
+            sub_domain = qname[:i]
+        return sub_domain
 
-    def _process_a_request(self, reply, qname):
-        self.logger.info("Send answer for A request - %s", self.ipv4)
-        reply.add_answer(RR(rname=qname, rtype=QTYPE.A, rclass=1, ttl=1, rdata=A(self.ipv4)))
+    def _process_ns_request(self, reply, qname, domain):
+        sub_domain = self._get_subdomain(qname, domain)
+        for record in self.domains[domain].get_records(sub_domain, DomainDB.NS_TYPE):
+            self.logger.info("Send answer for NS request - %s", record)
+            reply.add_answer(RR(rname=qname, rtype=QTYPE.NS, rclass=1, ttl=1, rdata=NS(record)))
 
-    def _process_aaaa_request(self, reply, qname):
-        if self.aaaa_handler:
-            self.aaaa_handler.process_request(reply, qname)
+    def _process_a_request(self, reply, qname, domain):
+        sub_domain = self._get_subdomain(qname, domain)
+        for record in self.domains[domain].get_records(sub_domain, DomainDB.A_TYPE):
+            self.logger.info("Send answer for A request - %s", record)
+            reply.add_answer(RR(rname=qname, rtype=QTYPE.A, rclass=1, ttl=1, rdata=A(record)))
 
-    def _process_dnskey_request(self, reply, qname):
-        if self.dnskey_handler:
-            self.dnskey_handler.process_request(reply, qname)
+    def _process_aaaa_request(self, reply, qname, domain):
+        sub_domain = self._get_subdomain(qname, domain)
+        for record in self.domains[domain].get_records(sub_domain, DomainDB.AAAA_TYPE):
+            reply.add_answer(RR(rname=qname, rtype=QTYPE.AAAA, rclass=1, ttl=1, rdata=AAAA(record)))
 
+    def _process_dnskey_request(self, reply, qname, domain):
+        sub_domain = self._get_subdomain(qname, domain)
+        for record in self.domains[domain].get_records(sub_domain, DomainDB.DNSKEY_TYPE):
+            reply.add_answer(RR(rname=qname, rtype=QTYPE.DNSKEY, rclass=1, ttl=1, rdata=record))
 
 def dns_response(data, transport):
     try:
@@ -1404,17 +1478,12 @@ def main():
     parser = argparse.ArgumentParser(description='Magic')
     parser.add_argument('--dport', default=53, type=int, help='The DNS port to listen on.')
     parser.add_argument('--lport', default=4444, type=int, help='The Meterpreter port to listen on.')
-    parser.add_argument('--domain', type=str, required=True, help='The domain name')
+    parser.add_argument('--domain', '-D', action='append', type=str, required=True, help='The domain name')
     parser.add_argument('--ipaddr', type=str, required=True, help='DNS IP')
 
     args = parser.parse_args()
-    ns_records = []
-
-    D = DomainName(args.domain + '.')  # Init domain string
-    ns_records.append(NS(D.ns1))
-    ns_records.append(NS(D.ns2))
-
-    DnsServer.create(args.domain, args.ipaddr, ns_records)
+    
+    DnsServer.create(args.domain, args.ipaddr)
 
     logger.info("Creating MSF listener ...")
     listener = MSFListener('0.0.0.0', args.lport)
