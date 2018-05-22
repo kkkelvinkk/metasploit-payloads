@@ -1474,30 +1474,78 @@ class UDPRequestHandler(BaseRequestHandlerDNS):
         return self.request[1].sendto(data, self.client_address)
 
 
+class ServerBuilder(object):
+    """
+    Build server based on command line arguments or config file
+    """
+    def __init__(self):
+        self.setup_seq = list()
+
+    def _parse_addr_port(self, param):
+        addr = None
+        port = param
+        if param.find(':'):
+            addr, port = param.split(':')
+        return (addr, int(port))
+
+    def setup_cmd_args(self, args):
+        dns_addr, dns_port = self._parse_addr_port(args.dnsaddr)
+        if not dns_addr and not args.ipaddr:
+            logger.error("should indicated one ip address for DNS(ip value in --dnsaddr or in --ipaddr parameter")
+            return False
+        
+        self.setup_seq.append((lambda: DnsServer.create(args.domain, dns_addr if dns_addr else args.ipaddr),))
+
+        msf_addr, msf_port = self._parse_addr_port(args.laddr)
+        listener = MSFListener(msf_addr if msf_addr else '0.0.0.0', msf_port)
+        self.setup_seq.append((lambda: listener.start_loop(),))
+
+        servers = [SocketServer.UDPServer(('', args.dport), UDPRequestHandler),
+                   SocketServer.TCPServer(('', args.dport), TCPRequestHandler)]
+
+        for s in servers:
+            thread = threading.Thread(target=s.serve_forever)  # that thread will start one more thread for each request
+            thread.daemon = True  # exit the server thread when the main thread terminates
+            thread.start()
+            logger.info("%s server loop running in thread: %s" % (s.RequestHandlerClass.__name__[:3], thread.name))
+
+    def setup_from_config(self, config_filename):
+        raise NotImplementedError()
+
+    def build(self):
+        def start_server():
+            for start_func, _ in self.setup_seq:
+                if start_func:
+                    start_func()
+        
+        def stop_server():
+            for _, stop_func in self.setup_seq:
+                if stop_func:
+                    stop_func()
+
+        return start_server, stop_server
+
+
 def main():
     parser = argparse.ArgumentParser(description='Magic')
-    parser.add_argument('--dport', default=53, type=int, help='The DNS port to listen on.')
-    parser.add_argument('--lport', default=4444, type=int, help='The Meterpreter port to listen on.')
-    parser.add_argument('--domain', '-D', action='append', type=str, required=True, help='The domain name')
+    parser.add_argument('--dnsaddr', default=53, type=str, help='The DNS [addr:]port to listen on.')
+    parser.add_argument('--laddr', default=4444, type=str, help='The Meterpreter [addr:]port to listen on.')
+    parser.add_argument('--domain', '-D', action='append', type=str, required=True, help='The domain name.')
     parser.add_argument('--ipaddr', type=str, required=True, help='DNS IP')
-
+    parser.add_argument('--config', type=str, help='Configuration file')
     args = parser.parse_args()
     
-    DnsServer.create(args.domain, args.ipaddr)
+    builder = ServerBuilder()
+    if args.config:
+        builder.setup_from_config(args.config_filename)
+    else:
+        builder.setup_cmd_args(args)
 
-    logger.info("Creating MSF listener ...")
-    listener = MSFListener('0.0.0.0', args.lport)
-    listener.start_loop()
-
-    logger.info("Starting nameserver ...")
-    servers = [SocketServer.UDPServer(('', args.dport), UDPRequestHandler),
-               SocketServer.TCPServer(('', args.dport), TCPRequestHandler)]
-
-    for s in servers:
-        thread = threading.Thread(target=s.serve_forever)  # that thread will start one more thread for each request
-        thread.daemon = True  # exit the server thread when the main thread terminates
-        thread.start()
-        logger.info("%s server loop running in thread: %s" % (s.RequestHandlerClass.__name__[:3], thread.name))
+    start_server, stop_server = builder.build()
+    try:
+        start_server()
+    except:
+        stop_server()
 
     try:
         while True:
@@ -1509,11 +1557,10 @@ def main():
     finally:
         logger.info("Shutdown server...")
         Registrator.instance().shutdown()
-        for s in servers:
-            s.shutdown()
-        listener.shutdown()
+        #for s in servers:
+        #    s.shutdown()
+        #listener.shutdown()
         logging.shutdown()
-
 
 if __name__ == '__main__':
     main()
