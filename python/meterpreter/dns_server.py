@@ -21,6 +21,7 @@ from logging.handlers import RotatingFileHandler
 import socket
 import select
 from contextlib import contextmanager
+from abc import ABC, abstractmethod
 
 try:
     from dnslib import *
@@ -1472,6 +1473,108 @@ class UDPRequestHandler(BaseRequestHandlerDNS):
 
     def send_data(self, data):
         return self.request[1].sendto(data, self.client_address)
+
+
+class ReactorObject(ABC):
+
+    def __init__(self, fd):
+        self.fd = fd
+
+    def get_fd(self):
+        return self.fd
+
+    @abstractmethod
+    def on_read(self):
+        pass
+
+    @abstractmethod
+    def on_write(self):
+        pass
+
+class RListener(ReactorObject):
+
+    def __init__(self, sock):
+        super(RListener, self).__init__(self, sock)
+
+    def listen(self):
+        self.fd.listen(1)
+
+    def close(self):
+        self.fd.close()
+
+    def accept(self):
+        return self.fd.accept()
+
+class RConnection(ReactorObject):
+    def __init__(self, sock):
+        super(RConnection, self).__init__(self, sock)
+
+class FDReactor(object):
+    SELECT_TIMEOUT = 10
+
+    def __init__(self):
+        pipe = os.pipe()
+        self.poll_pipe = (os.fdopen(pipe[0], "r", 0), os.fdopen(pipe[1], "w", 0))
+        self.thread = threading.Thread(self._loop)
+        self.thread.setDaemon(True)
+        self.shutdown_evt = threading.Event()
+        self.listeners = []
+        self.connections = []
+
+    def create_listener(self, addr, port):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setblocking(False)
+        sock.bind((addr, port))
+        listener = RListener(sock)
+        self.listeners.append(listener)
+        return listener
+
+    def start_loop(self):
+        self.thread.start()
+
+    def wait_finish(self):
+        self.thread.join()
+
+    def shutdown(self):
+        self.shutdown_evt.set()
+        self._pool()
+
+    def _pool(self):
+        self.poll_pipe[1].write("\x01")        
+
+
+    def _find_object(self, obj, lst):
+        result = None
+        for item in lst:
+            if item.get_fd() == obj:
+                result = item
+                break
+        return result
+
+    def _loop(self):
+        while not self.shutdown_evt.is_set():
+            inputs = [self.poll_pipe[0]]
+            for l in self.listeners:
+                inputs.append(l.get_fd())
+
+            for c in self.connections:
+                inputs.append(l.get_fd())
+            outputs = []
+
+            read_lst, write_lst, exc_lst = select.select(inputs, outputs, inputs, self.SELECT_TIMEOUT)
+
+            if read_lst:
+                for read_fd in read_lst:
+                    listener = self._find_object(read_fd, self.listeners)
+                    if listener:
+                        sock, addr = listener.accept()
+                        new_connection = RConnection(sock)
+                        self.connections.append(new_connection)
+            
+            if write_lst:
+                pass
+        for l in self.listeners:
+            l.close()
 
 
 class ServerBuilder(object):
