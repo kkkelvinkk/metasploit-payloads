@@ -21,6 +21,7 @@ from logging.handlers import RotatingFileHandler
 import socket
 import select
 from contextlib import contextmanager
+from errno import EINPROGRESS, EWOULDBLOCK
 
 try:
     from dnslib import *
@@ -1170,6 +1171,11 @@ class MSFClient(object):
                 self._on_closing_connection()
                 return None
             return data
+        except socket.error as e:
+            if e.args[0] in (EINPROGRESS, EWOULDBLOCK):
+                return None
+            else:
+                raise
         except:
             # connection closed
             MSFClient.LOGGER.error("Exception during read. Closing connection.", exc_info=True)
