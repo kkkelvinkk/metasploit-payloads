@@ -21,7 +21,9 @@ from logging.handlers import RotatingFileHandler
 import socket
 import select
 from contextlib import contextmanager
-from abc import ABC, abstractmethod
+from abc import ABCMeta, abstractmethod
+import errno
+
 
 try:
     from dnslib import *
@@ -1475,13 +1477,47 @@ class UDPRequestHandler(BaseRequestHandlerDNS):
         return self.request[1].sendto(data, self.client_address)
 
 
-class ReactorObject(ABC):
+class ReactorObject(object):
+    __metaclass__ = ABCMeta
 
-    def __init__(self, fd):
+    def __init__(self, fd, reactor=None):
         self.fd = fd
+        self.reactor = reactor
+        self.in_loop = False
+        self.closed = False
 
     def get_fd(self):
         return self.fd
+
+    def add_to_loop(self, reactor=None):
+        if reactor:
+            self.reactor = reactor
+
+        if self.reactor:
+            self.reactor._add_to_loop(self)
+            self.in_loop = True
+        else:
+            raise ValueError("Reactor object is not set")
+
+    def close(self):
+        if self.in_loop:
+            self.reactor._remove_from_loop(self)
+            self.in_loop = False
+
+        if not self.closed:
+            self.fd.close()
+            self.closed = True
+        self.reactor = None
+
+    def _close(self):
+        """
+        Called by reactor when event loop is ended
+        """
+        self.in_loop = False
+        if not self.closed:
+            self.fd.close()
+            self.closed = True
+        self.reactor = None
 
     @abstractmethod
     def on_read(self):
@@ -1491,23 +1527,77 @@ class ReactorObject(ABC):
     def on_write(self):
         pass
 
-class RListener(ReactorObject):
+    @abstractmethod
+    def want_read(self):
+        return False
 
-    def __init__(self, sock):
-        super(RListener, self).__init__(self, sock)
+    @abstractmethod
+    def want_write(self):
+        return False
 
-    def listen(self):
-        self.fd.listen(1)
-
-    def close(self):
-        self.fd.close()
-
-    def accept(self):
-        return self.fd.accept()
 
 class RConnection(ReactorObject):
     def __init__(self, sock):
         super(RConnection, self).__init__(self, sock)
+    
+    def want_read(self):
+        return False
+
+    def want_write(self):
+        return False
+
+    def on_read(self):
+        self.fd.read()
+
+    def on_write(self):
+        pass
+
+class RConnectionFactory(object):
+
+    def __init__(self):
+        pass
+
+    def create_connection(self, sock, address):
+        connection = RConnection(sock)
+        return connection
+
+class RListener(ReactorObject):
+
+    def __init__(self, sock, reactor=None, connection_factory=RConnectionFactory, **kwargs):
+        super(RListener, self).__init__(sock, reactor)
+        self.need_listen = True
+        self.conn_factory = connection_factory
+
+    def want_listen(self):
+        return self.need_listen
+
+    def listen(self):
+        self.fd.listen(1)
+        self.need_listen = False
+
+    def want_read(self):
+        return True
+
+    def want_write(self):
+        return False
+
+    def on_read(self):
+        sock, address = self.fd.accept()
+        connection = self.conn_factory.create_connection(sock, address)
+        return connection
+
+    def on_write(self):
+        raise RuntimeError("on write have not be happens on listener")
+
+
+class RListenerFactory(object):
+    def __init__(self, connection_factory=RConnectionFactory()):
+        self.connection_factory = connection_factory
+
+    def create_listener(self, sock, addr, port, **kwargs):
+        listener = RListener(sock, connection_factory=self.connection_factory, **kwargs)
+        return listener
+
 
 class FDReactor(object):
     SELECT_TIMEOUT = 10
@@ -1515,21 +1605,36 @@ class FDReactor(object):
     def __init__(self):
         pipe = os.pipe()
         self.poll_pipe = (os.fdopen(pipe[0], "r", 0), os.fdopen(pipe[1], "w", 0))
-        self.thread = threading.Thread(self._loop)
+        self.thread = threading.Thread(target=self._loop)
         self.thread.setDaemon(True)
         self.shutdown_evt = threading.Event()
         self.listeners = []
         self.connections = []
+        self.lock = threading.RLock()
+        self.in_poll = False
 
-    def create_listener(self, addr, port):
+    def create_listener(self, addr, port, listener_factory=RListenerFactory, monitor=True):
+        listener = None
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setblocking(False)
-        sock.bind((addr, port))
-        listener = RListener(sock)
-        self.listeners.append(listener)
+
+        try:
+            sock.bind((addr, port))
+        except socket.error as e:
+            if e.args[0] == errno.EADDRINUSE:
+                return listener
+            else:
+                raise
+        
+        listener = listener_factory.create_listener(sock, addr, port, reactor=self)
+        if monitor:
+            listener.add_to_loop()
         return listener
 
     def start_loop(self):
+        if self.shutdown_evt.is_set():
+            raise RuntimeError("Can't start loop after shutdown")
+
         self.thread.start()
 
     def wait_finish(self):
@@ -1539,9 +1644,34 @@ class FDReactor(object):
         self.shutdown_evt.set()
         self._pool()
 
-    def _pool(self):
-        self.poll_pipe[1].write("\x01")        
+    def _add_to_loop(self, obj):
+        if self.shutdown_evt.is_set():
+            return
 
+        with self.lock:
+            if isinstance(obj, RListener):
+                self.listeners.append(obj)
+            elif isinstance(obj, RConnection):
+                self.connections.append(obj)
+            else:
+                raise ValueError("object of type %s is not supported" % type(obj).__name__)
+        self._pool()
+
+    def _remove_from_loop(self, obj):
+        with self.lock:
+            if isinstance(obj, RListener):
+                self.listeners.remove(obj)
+            elif isinstance(obj, RConnection):
+                self.connections.remove(obj)
+            else:
+                raise ValueError("object of type %s is not supported" % type(obj).__name__)
+        self._pool()
+
+    def _pool(self):
+        with self.lock:
+            if not self.in_poll:
+                self.poll_pipe[1].write("\x01")        
+                self.in_poll = True
 
     def _find_object(self, obj, lst):
         result = None
@@ -1554,27 +1684,50 @@ class FDReactor(object):
     def _loop(self):
         while not self.shutdown_evt.is_set():
             inputs = [self.poll_pipe[0]]
-            for l in self.listeners:
-                inputs.append(l.get_fd())
-
-            for c in self.connections:
-                inputs.append(l.get_fd())
             outputs = []
+            map_fd = {}
+            with self.lock:
+                for l in self.listeners:
+                    if l.want_listen():
+                        l.listen()
+                    if l.want_read():
+                        fd = l.get_fd()
+                        inputs.append(fd)
+                        map_fd[fd] = l
 
-            read_lst, write_lst, exc_lst = select.select(inputs, outputs, inputs, self.SELECT_TIMEOUT)
+                for c in self.connections:
+                    fd = c.get_fd()
+                    if c.want_read():
+                        inputs.append(c)
+                        map_fd[fd] = c
+                    elif c.want_write():
+                        outputs.append(fd)
+                        map_fd[fd] = c
+
+            read_lst, write_lst, _ = select.select(inputs, outputs, inputs, self.SELECT_TIMEOUT)
 
             if read_lst:
                 for read_fd in read_lst:
-                    listener = self._find_object(read_fd, self.listeners)
-                    if listener:
-                        sock, addr = listener.accept()
-                        new_connection = RConnection(sock)
-                        self.connections.append(new_connection)
-            
+                    if read_fd != self.poll_pipe[0]:
+                        map_fd[read_fd].on_read()
+                    else:
+                        read_fd.read(1)
+                        with self.lock:
+                            self.in_poll = False
+
             if write_lst:
-                pass
+                for write_fd in write_lst:
+                    map_fd[write_fd].on_write()
+            
+        # cycle id ended.Close connections and clear arrays
         for l in self.listeners:
-            l.close()
+            l._close()
+        for c in self.connections:
+            c._close()
+        self.listeners = []
+        self.connections = []
+        os.close(self.poll_pipe[0])
+        os.close(self.poll_pipe[1])
 
 
 class ServerBuilder(object):
