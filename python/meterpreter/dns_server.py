@@ -23,6 +23,7 @@ import select
 from contextlib import contextmanager
 from abc import ABCMeta, abstractmethod
 import errno
+from collections import deque
 
 
 try:
@@ -356,7 +357,7 @@ class Registrator(object):
             try:
                 client_id = self.id_list.pop(0)
                 self.clientMap[client_id] = client
-            except IndexError as e:
+            except IndexError:
                 self.logger.error("Can't find free id for new client.", exc_info=True)
                 return None
         return client_id
@@ -1008,7 +1009,7 @@ class DnsServer(object):
                 try:
                     self.logger.info("Process request for type %s", qt)
                     self.handlers[qtype](reply, qn, domain)
-                except KeyError as e:
+                except KeyError:
                     self.logger.info("%s request type is not supported", qt)
                 break
         else:
@@ -1411,17 +1412,17 @@ class MSFListener(object):
         self.listen_socket.listen(1)
 
         while not self.shutdown_event.is_set():
-            inputs = [self.listen_socket, self.poll_pipe[0]]
+            readers = [self.listen_socket, self.poll_pipe[0]]
             outputs = []
 
             for cl in self.clients:
                 s = cl.get_socket()
                 if s:
-                    inputs.append(s)
+                    readers.append(s)
                     if cl.want_write():
                         outputs.append(s)
 
-            read_lst, write_lst, exc_lst = select.select(inputs, outputs, inputs, MSFListener.SELECT_TIMEOUT)
+            read_lst, write_lst, _ = select.select(readers, outputs, readers, MSFListener.SELECT_TIMEOUT)
 
             # handle input
             for s in read_lst:
@@ -1476,13 +1477,12 @@ class UDPRequestHandler(BaseRequestHandlerDNS):
     def send_data(self, data):
         return self.request[1].sendto(data, self.client_address)
 
-
 class ReactorObject(object):
     __metaclass__ = ABCMeta
 
-    def __init__(self, fd, reactor=None):
+    def __init__(self, fd, reactor):
         self.fd = fd
-        self.reactor = reactor
+        self.reactor = reactor 
         self.in_loop = False
         self.closed = False
 
@@ -1498,6 +1498,10 @@ class ReactorObject(object):
             self.in_loop = True
         else:
             raise ValueError("Reactor object is not set")
+
+    def _notify(self):
+        if self.reactor:
+            self.reactor._pool()
 
     def close(self):
         if self.in_loop:
@@ -1537,33 +1541,71 @@ class ReactorObject(object):
 
 
 class RConnection(ReactorObject):
-    def __init__(self, sock):
-        super(RConnection, self).__init__(self, sock)
+    def __init__(self, sock, reactor=None):
+        super(RConnection, self).__init__(sock, reactor)
+        self.write_queue = deque()
+        self.read_queue = deque()
     
     def want_read(self):
-        return False
+        return len(self.read_queue) != 0
 
     def want_write(self):
-        return False
+        return len(self.write_queue) != 0
+
+    def read_data(self, size):
+        return self.fd.recv(size)
+
+    def send_data(self, data):
+        return self.fd.send(data)
+
+    def _get_task(self, q):
+        tsk = None
+        if len(q) != 0:
+            tsk = q[0]
+        return tsk
 
     def on_read(self):
-        self.fd.read()
+        read_task = self._get_task(self.read_queue)
+        if read_task:
+            read_task.on_event(self, RConnectionTask.EVENT_READ)
 
     def on_write(self):
-        pass
+        write_task = self._get_task(self.write_queue)
+        if write_task:
+            write_task.on_event(self, RConnectionTask.EVENT_WRITE)
+
+    def append_task(self, task, task_type):
+        if task_type == RConnectionTask.READ_TASK:
+            self.read_queue.append(task)
+        else:
+            self.write_queue.append(task)
+        self._notify()
+
+    def task_done(self, task):
+        print("delete", task)
+        try:
+            self.read_queue.remove(task)
+            self.write_queue.remove(task)
+        except:
+            pass
 
 class RConnectionFactory(object):
 
-    def __init__(self):
-        pass
+    def __init__(self, connection_cls = RConnection):
+        self.connection_cls = connection_cls
 
-    def create_connection(self, sock, address):
-        connection = RConnection(sock)
+    def create_connection(self, sock, address , reactor):
+        print("new connection")
+        connection = self.connection_cls(sock)
+        task = RecieveTask(10)
+        task.run(connection)
+        connection.add_to_loop(reactor)
         return connection
 
 class RListener(ReactorObject):
 
-    def __init__(self, sock, reactor=None, connection_factory=RConnectionFactory, **kwargs):
+    def __init__(self, sock, reactor=None, connection_factory=RConnectionFactory(), **kwargs):
+        print(kwargs, reactor)
         super(RListener, self).__init__(sock, reactor)
         self.need_listen = True
         self.conn_factory = connection_factory
@@ -1583,7 +1625,8 @@ class RListener(ReactorObject):
 
     def on_read(self):
         sock, address = self.fd.accept()
-        connection = self.conn_factory.create_connection(sock, address)
+        print(self.conn_factory)
+        connection = self.conn_factory.create_connection(sock, address, self.reactor)
         return connection
 
     def on_write(self):
@@ -1602,7 +1645,7 @@ class RListenerFactory(object):
 class FDReactor(object):
     SELECT_TIMEOUT = 10
 
-    def __init__(self):
+    def __init__(self, loop_timeout=FDReactor.SELECT_TIMEOUT):
         pipe = os.pipe()
         self.poll_pipe = (os.fdopen(pipe[0], "r", 0), os.fdopen(pipe[1], "w", 0))
         self.thread = threading.Thread(target=self._loop)
@@ -1612,8 +1655,9 @@ class FDReactor(object):
         self.connections = []
         self.lock = threading.RLock()
         self.in_poll = False
+        self.loop_timeout = loop_timeout
 
-    def create_listener(self, addr, port, listener_factory=RListenerFactory, monitor=True):
+    def create_listener(self, addr, port, listener_factory=RListenerFactory(), monitor=True):
         listener = None
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setblocking(False)
@@ -1638,7 +1682,11 @@ class FDReactor(object):
         self.thread.start()
 
     def wait_finish(self):
-        self.thread.join()
+        try:
+            while self.thread.isAlive():
+                self.thread.join(1)
+        except KeyboardInterrupt:
+            self.shutdown()
 
     def shutdown(self):
         self.shutdown_evt.set()
@@ -1673,18 +1721,10 @@ class FDReactor(object):
                 self.poll_pipe[1].write("\x01")        
                 self.in_poll = True
 
-    def _find_object(self, obj, lst):
-        result = None
-        for item in lst:
-            if item.get_fd() == obj:
-                result = item
-                break
-        return result
-
     def _loop(self):
         while not self.shutdown_evt.is_set():
-            inputs = [self.poll_pipe[0]]
-            outputs = []
+            readers = [self.poll_pipe[0]]
+            writers = []
             map_fd = {}
             with self.lock:
                 for l in self.listeners:
@@ -1692,19 +1732,19 @@ class FDReactor(object):
                         l.listen()
                     if l.want_read():
                         fd = l.get_fd()
-                        inputs.append(fd)
+                        readers.append(fd)
                         map_fd[fd] = l
 
                 for c in self.connections:
                     fd = c.get_fd()
                     if c.want_read():
-                        inputs.append(c)
+                        readers.append(fd)
                         map_fd[fd] = c
                     elif c.want_write():
-                        outputs.append(fd)
+                        writers.append(fd)
                         map_fd[fd] = c
 
-            read_lst, write_lst, _ = select.select(inputs, outputs, inputs, self.SELECT_TIMEOUT)
+            read_lst, write_lst, _ = select.select(readers, writers, readers, self.loop_timeout)
 
             if read_lst:
                 for read_fd in read_lst:
@@ -1728,6 +1768,142 @@ class FDReactor(object):
         self.connections = []
         os.close(self.poll_pipe[0])
         os.close(self.poll_pipe[1])
+
+
+class RConnectionTask(object):
+    EVENT_READ, EVENT_WRITE, EVENT_ERROR = range(3)
+    READ_TASK, WRITE_TASK = task_types = range(2)
+    WORK_F, IS_DONE_F, DONE_F, ERROR_F = func_types = range(10, 14) 
+
+    def __init__(self, task_type):
+        self.connection = None
+        if task_type not in self.task_types:
+            raise ValueError("Bad task type")
+        self.task_type = task_type
+        self.func_set = {}
+        for attr in self.__class__.__dict__.values():
+            if callable(attr) and hasattr(attr, "task_type"):
+                self.func_set[attr.task_type] = attr.__get__(self)
+
+    def _set_func(self, func_type, func):
+        if not func or func_type not in self.func_types:
+            return
+        
+        self.func_set[func_type] = func
+    
+    def _is_bad_event(self, event_type):
+        event_read_task_write = (self.task_type == self.WRITE_TASK) and \
+                                (event_type == self.EVENT_READ)
+        
+        event_write_task_read = (self.task_type == self.READ_TASK) and \
+                                (event_type == self.EVENT_WRITE)
+        
+        return event_read_task_write or event_write_task_read
+
+
+    def on_event(self, connection, event_type):
+        if (event_type == self.EVENT_ERROR) or \
+            self._is_bad_event(event_type) or \
+            (connection != self.connection):
+            self.func_set[self.ERROR_F]()
+            self.connection = None
+            return
+
+        self.func_set[self.WORK_F](connection)
+        if (self.func_set[self.IS_DONE_F]()):
+            connection.task_done(self)
+            self.func_set[self.DONE_F](connection)
+            self.connection = None
+
+    def run(self, connection):
+        if self.connection:
+            raise RuntimeError("This task is already run")
+        connection.append_task(self, self.task_type)
+        self.connection = connection
+
+    @staticmethod
+    def work_f(fn):
+        def f(*args, **kwargs):
+            return fn(*args, **kwargs)
+        f.task_type = RConnectionTask.WORK_F
+        return f
+
+    @staticmethod
+    def error_f(fn):
+        def f(*args, **kwargs):
+            return fn(*args, **kwargs)
+        f.task_type = RConnectionTask.ERROR_F
+        return f
+
+    @staticmethod
+    def is_done_f(fn):
+        def f(*args, **kwargs):
+            return fn(*args, **kwargs)
+        f.task_type = RConnectionTask.IS_DONE_F
+        return f
+
+    @staticmethod
+    def done_f(fn):
+        def f(*args, **kwargs):
+            return fn(*args, **kwargs)
+        f.task_type = RConnectionTask.DONE_F
+        return f
+
+
+class RecieveTask(RConnectionTask):
+    def __init__(self, size):
+        super(RecieveTask, self).__init__(RConnectionTask.READ_TASK)
+        self.need_read = size
+        self.data = bytearray() 
+
+    @RConnectionTask.work_f
+    def _receive_data(self, connection):
+        data = connection.read_data(self.need_read)
+        self.data.extend(data)
+        data_len = len(data)
+        self.need_read -= data_len
+
+    @RConnectionTask.is_done_f
+    def _is_done(self):
+        return (self.need_read <= 0)
+
+    @RConnectionTask.error_f
+    def _on_error(self):
+        print("Error")
+
+    @RConnectionTask.done_f
+    def _done(self, connection):
+        print("Done")
+        print(self.data)
+        send_task = SendTask("Hello guys!!!\n")
+        send_task.run(connection)
+
+
+class SendTask(RConnectionTask):
+    def __init__(self, data):
+        super(SendTask, self).__init__(RConnectionTask.WRITE_TASK)
+        self.data = data
+        self.need_send = len(data)
+        self.idx = 0
+
+    @RConnectionTask.work_f
+    def _send_data(self, connection):
+        num_send = connection.send_data(self.data[self.idx:])
+        self.need_send -= num_send
+        self.idx += num_send 
+
+    @RConnectionTask.is_done_f
+    def _is_done(self):
+        return (self.need_send <= 0)
+
+    @RConnectionTask.error_f
+    def _on_error(self):
+        print("error")
+
+    @RConnectionTask.done_f
+    def _done(self, connection):
+        print("Done")
+        connection.close()
 
 
 class ServerBuilder(object):
