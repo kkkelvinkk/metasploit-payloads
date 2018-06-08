@@ -24,7 +24,8 @@ from contextlib import contextmanager
 from abc import ABCMeta, abstractmethod
 import errno
 from collections import deque
-
+from functools import partial
+import types
 
 try:
     from dnslib import *
@@ -95,10 +96,461 @@ def ignored(*exceptions):
         pass
 
 
-class DomainName(str):
-    def __getattr__(self, item):
-        return DomainName(item + '.' + self)
+class ReactorObject(object):
+    __metaclass__ = ABCMeta
 
+    def __init__(self, fd, reactor):
+        self.fd = fd
+        self.reactor = reactor 
+        self.in_loop = False
+        self.closed = False
+
+    def get_fd(self):
+        return self.fd
+
+    def add_to_loop(self, reactor=None):
+        if reactor:
+            self.reactor = reactor
+
+        if self.reactor:
+            self.reactor._add_to_loop(self)
+            self.in_loop = True
+        else:
+            raise ValueError("Reactor object is not set")
+
+    def _notify(self):
+        if self.reactor:
+            self.reactor._pool()
+
+    def close(self):
+        if self.in_loop:
+            self.reactor._remove_from_loop(self)
+            self.in_loop = False
+
+        if not self.closed:
+            self.fd.close()
+            self.closed = True
+        self.reactor = None
+
+    def _close(self):
+        """
+        Called by reactor when event loop is ended
+        """
+        self.in_loop = False
+        if not self.closed:
+            self.fd.close()
+            self.closed = True
+        self.reactor = None
+
+    @abstractmethod
+    def on_read(self):
+        pass
+
+    @abstractmethod
+    def on_write(self):
+        pass
+
+    @abstractmethod
+    def want_read(self):
+        return False
+
+    @abstractmethod
+    def want_write(self):
+        return False
+
+
+class RConnection(ReactorObject):
+    def __init__(self, sock, reactor=None):
+        super(RConnection, self).__init__(sock, reactor)
+        self.write_queue = deque()
+        self.read_queue = deque()
+    
+    def want_read(self):
+        return len(self.read_queue) != 0
+
+    def want_write(self):
+        return len(self.write_queue) != 0
+
+    def read_data(self, size):
+        return self.fd.recv(size)
+
+    def send_data(self, data):
+        return self.fd.send(data)
+
+    def _get_task(self, q):
+        tsk = None
+        if len(q) != 0:
+            tsk = q[0]
+        return tsk
+
+    def on_read(self):
+        read_task = self._get_task(self.read_queue)
+        if read_task:
+            read_task.on_event(self, RConnectionTask.EVENT_READ)
+
+    def on_write(self):
+        write_task = self._get_task(self.write_queue)
+        if write_task:
+            write_task.on_event(self, RConnectionTask.EVENT_WRITE)
+
+    def append_task(self, task, task_type):
+        if task_type == RConnectionTask.READ_TASK:
+            self.read_queue.append(task)
+        else:
+            self.write_queue.append(task)
+        self._notify()
+
+    def task_done(self, task):
+        print("delete", task)
+        try:
+            self.read_queue.remove(task)
+            self.write_queue.remove(task)
+        except:
+            pass
+
+class RConnectionFactory(object):
+
+    def __init__(self, connection_cls = RConnection):
+        self.connection_cls = connection_cls
+
+    def create_connection(self, sock, address , reactor):
+        print("new connection")
+        connection = self.connection_cls(sock)
+        task = RecieveTask(10)
+        task.run(connection)
+        connection.add_to_loop(reactor)
+        return connection
+
+class RListener(ReactorObject):
+
+    def __init__(self, sock, reactor=None, connection_factory=RConnectionFactory(), **kwargs):
+        print(kwargs, reactor)
+        super(RListener, self).__init__(sock, reactor)
+        self.need_listen = True
+        self.conn_factory = connection_factory
+
+    def want_listen(self):
+        return self.need_listen
+
+    def listen(self):
+        self.fd.listen(1)
+        self.need_listen = False
+
+    def want_read(self):
+        return True
+
+    def want_write(self):
+        return False
+
+    def on_read(self):
+        sock, address = self.fd.accept()
+        print(self.conn_factory)
+        connection = self.conn_factory.create_connection(sock, address, self.reactor)
+        return connection
+
+    def on_write(self):
+        raise RuntimeError("on write have not be happens on listener")
+
+
+class RListenerFactory(object):
+    def __init__(self, connection_factory=RConnectionFactory()):
+        self.connection_factory = connection_factory
+
+    def create_listener(self, sock, addr, port, **kwargs):
+        listener = RListener(sock, connection_factory=self.connection_factory, **kwargs)
+        return listener
+
+
+class FDReactor(object):
+    SELECT_TIMEOUT = 10
+
+    def __init__(self, loop_timeout=FDReactor.SELECT_TIMEOUT):
+        pipe = os.pipe()
+        self.poll_pipe = (os.fdopen(pipe[0], "r", 0), os.fdopen(pipe[1], "w", 0))
+        self.thread = threading.Thread(target=self._loop)
+        self.thread.setDaemon(True)
+        self.shutdown_evt = threading.Event()
+        self.listeners = []
+        self.connections = []
+        self.lock = threading.RLock()
+        self.in_poll = False
+        self.loop_timeout = loop_timeout
+
+    def create_listener(self, addr, port, listener_factory=RListenerFactory(), monitor=True):
+        listener = None
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setblocking(False)
+
+        try:
+            sock.bind((addr, port))
+        except socket.error as e:
+            if e.args[0] == errno.EADDRINUSE:
+                return listener
+            else:
+                raise
+        
+        listener = listener_factory.create_listener(sock, addr, port, reactor=self)
+        if monitor:
+            listener.add_to_loop()
+        return listener
+
+    def start_loop(self):
+        if self.shutdown_evt.is_set():
+            raise RuntimeError("Can't start loop after shutdown")
+
+        self.thread.start()
+
+    def wait_finish(self):
+        try:
+            while self.thread.isAlive():
+                self.thread.join(1)
+        except KeyboardInterrupt:
+            self.shutdown()
+
+    def shutdown(self):
+        self.shutdown_evt.set()
+        self._pool()
+
+    def _add_to_loop(self, obj):
+        if self.shutdown_evt.is_set():
+            return
+
+        with self.lock:
+            if isinstance(obj, RListener):
+                self.listeners.append(obj)
+            elif isinstance(obj, RConnection):
+                self.connections.append(obj)
+            else:
+                raise ValueError("object of type %s is not supported" % type(obj).__name__)
+        self._pool()
+
+    def _remove_from_loop(self, obj):
+        with self.lock:
+            if isinstance(obj, RListener):
+                self.listeners.remove(obj)
+            elif isinstance(obj, RConnection):
+                self.connections.remove(obj)
+            else:
+                raise ValueError("object of type %s is not supported" % type(obj).__name__)
+        self._pool()
+
+    def _pool(self):
+        with self.lock:
+            if not self.in_poll:
+                self.poll_pipe[1].write("\x01")        
+                self.in_poll = True
+
+    def _loop(self):
+        while not self.shutdown_evt.is_set():
+            readers = [self.poll_pipe[0]]
+            writers = []
+            map_fd = {}
+            with self.lock:
+                for l in self.listeners:
+                    if l.want_listen():
+                        l.listen()
+                    if l.want_read():
+                        fd = l.get_fd()
+                        readers.append(fd)
+                        map_fd[fd] = l
+
+                for c in self.connections:
+                    fd = c.get_fd()
+                    if c.want_read():
+                        readers.append(fd)
+                        map_fd[fd] = c
+                    elif c.want_write():
+                        writers.append(fd)
+                        map_fd[fd] = c
+
+            read_lst, write_lst, _ = select.select(readers, writers, readers, self.loop_timeout)
+
+            if read_lst:
+                for read_fd in read_lst:
+                    if read_fd != self.poll_pipe[0]:
+                        map_fd[read_fd].on_read()
+                    else:
+                        read_fd.read(1)
+                        with self.lock:
+                            self.in_poll = False
+
+            if write_lst:
+                for write_fd in write_lst:
+                    map_fd[write_fd].on_write()
+            
+        # cycle id ended.Close connections and clear arrays
+        for l in self.listeners:
+            l._close()
+        for c in self.connections:
+            c._close()
+        self.listeners = []
+        self.connections = []
+        os.close(self.poll_pipe[0])
+        os.close(self.poll_pipe[1])
+
+
+class RConnectionTask(object):
+    EVENT_READ, EVENT_WRITE, EVENT_ERROR = range(3)
+    READ_TASK, WRITE_TASK = task_types = range(2)
+    WORK_F, IS_DONE_F, DONE_F, ERROR_F = func_types = range(10, 14) 
+
+    def __init__(self, task_type):
+        self.connection = None
+        if task_type not in self.task_types:
+            raise ValueError("Bad task type")
+        self.task_type = task_type
+        self.func_set = {}
+        for attr in self.__class__.__dict__.values():
+            if callable(attr) and hasattr(attr, "task_type"):
+                self.func_set[attr.task_type] = attr.__get__(self)
+
+    def _set_func(self, func_type, func):
+        if not func or func_type not in self.func_types:
+            return
+        
+        self.func_set[func_type] = func
+    
+    def _is_bad_event(self, event_type):
+        event_read_task_write = (self.task_type == self.WRITE_TASK) and \
+                                (event_type == self.EVENT_READ)
+        
+        event_write_task_read = (self.task_type == self.READ_TASK) and \
+                                (event_type == self.EVENT_WRITE)
+        
+        return event_read_task_write or event_write_task_read
+
+
+    def on_event(self, connection, event_type):
+        if (event_type == self.EVENT_ERROR) or \
+            self._is_bad_event(event_type) or \
+            (connection != self.connection):
+            self.func_set[self.ERROR_F]()
+            self.connection = None
+            return
+
+        self.func_set[self.WORK_F](connection)
+        if (self.func_set[self.IS_DONE_F]()):
+            connection.task_done(self)
+            self.func_set[self.DONE_F](connection)
+            self.connection = None
+
+    def run(self, connection):
+        if self.connection:
+            raise RuntimeError("This task is already run")
+        connection.append_task(self, self.task_type)
+        self.connection = connection
+
+    @staticmethod
+    def work_f(fn):
+        def f(*args, **kwargs):
+            return fn(*args, **kwargs)
+        f.task_type = RConnectionTask.WORK_F
+        return f
+
+    @staticmethod
+    def error_f(fn):
+        def f(*args, **kwargs):
+            return fn(*args, **kwargs)
+        f.task_type = RConnectionTask.ERROR_F
+        return f
+
+    @staticmethod
+    def is_done_f(fn):
+        def f(*args, **kwargs):
+            return fn(*args, **kwargs)
+        f.task_type = RConnectionTask.IS_DONE_F
+        return f
+
+    @staticmethod
+    def done_f(fn):
+        def f(*args, **kwargs):
+            return fn(*args, **kwargs)
+        f.task_type = RConnectionTask.DONE_F
+        return f
+
+
+class RecieveTask(RConnectionTask):
+    def __init__(self, size, complete_func=None):
+        super(RecieveTask, self).__init__(RConnectionTask.READ_TASK)
+        self.need_read = size
+        self.data = bytearray() 
+        self.complete_func = complete_func
+
+    def set_complete_func(self, complete_func=None):
+        self.complete_func = complete_func
+
+    @RConnectionTask.work_f
+    def _receive_data(self, connection):
+        data = connection.read_data(self.need_read)
+        self.data.extend(data)
+        data_len = len(data)
+        self.need_read -= data_len
+
+    @RConnectionTask.is_done_f
+    def _is_done(self):
+        return (self.need_read <= 0)
+
+    @RConnectionTask.error_f
+    def _on_error(self):
+        print("Error")
+
+    @RConnectionTask.done_f
+    def _done(self, connection):
+        if self.complete_func:
+            self.complete_func(self.data)
+
+
+class SendTask(RConnectionTask):
+    def __init__(self, data):
+        super(SendTask, self).__init__(RConnectionTask.WRITE_TASK)
+        self.data = data
+        self.need_send = len(data)
+        self.idx = 0
+
+    @RConnectionTask.work_f
+    def _send_data(self, connection):
+        num_send = connection.send_data(self.data[self.idx:])
+        self.need_send -= num_send
+        self.idx += num_send 
+
+    @RConnectionTask.is_done_f
+    def _is_done(self):
+        return (self.need_send <= 0)
+
+    @RConnectionTask.error_f
+    def _on_error(self):
+        print("error")
+
+    @RConnectionTask.done_f
+    def _done(self, connection):
+        print("Done")
+        connection.close()
+
+
+def connection_task(func):
+    if not isinstance(func, types.GeneratorType):
+        raise TypeError("Function instanse is not generator")
+
+    def _callback_done(gen, *cb_args):
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+        else:
+            raise RuntimeError("generator object have to be produce only one yield")
+
+    def decorated(*args, **kwargs):
+        try:
+            gen = func(*args, **kwargs)
+            task, conn = next(gen)
+            if isinstance(task, RecieveTask):
+                callback = partial(_callback_done, gen)
+                task.set_complete_func(callback)
+            task.run(conn)
+        except StopIteration:
+            raise RuntimeError("Generator object for task have to be produce one yield")
+
+    return decorated
 
 class Encoder(object):
     MAX_PACKET_SIZE = -1
@@ -1100,6 +1552,9 @@ class LSClient(WithLogger):
     Listener side client. It handles socket connection that
     comes from listener.
     """
+
+    HEADER_SIZE = 32
+    
     def __init__(self, connection):
         self.connection = connection
         # enable keep-alive every minute
@@ -1108,19 +1563,22 @@ class LSClient(WithLogger):
         # sock.setsockopt(socket.SOL_TCP, socket.TCP_KEEPCNT, 4)
         # sock.setsockopt(socket.SOL_TCP, socket.TCP_KEEPINTVL, 15)
         # sock.setblocking(False)
-        self._start_read_id_size()
+        self.msf_id = ""
+        self.client = None
+        self._read_id_size()
 
-    def _start_read_id_size(self):
-        task = RecieveTask(1, self._read_id_done)
-        task.run(self.connection)
+    @connection_task
+    def _read_id_size(self):
+        task = RecieveTask(1)
+        yield task, self.connection
+        id_size = struct.unpack("B", task.data)[0]
+        self._read_id(id_size)
 
-    def _read_id_size_done(self, data):
-        id_size = struct.unpack("B", data)[0]
-        task = RecieveTask(id_size, self._read_id_done)
-        task.run(self.connection)
-
-    def _read_id_done(self, data):
-        self.msf_id = data.get_data()
+    @connection_task
+    def _read_id(self, id_size):
+        task = RecieveTask(id_size)
+        yield task, self.connection
+        self.msf_id = task.data
         if self._setup_client():
             self._logger.info("New client is found.")
             self._read_status()
@@ -1130,11 +1588,10 @@ class LSClient(WithLogger):
             self.wait_client = True
             Registrator.instance().subscribe(self.msf_id, self)
 
+    @connection_task
     def _read_status(self):
-        task = RecieveTask(1, self._read_status_complete)
-        task.run(self.connection)
-
-    def _read_status_complete(self, data):
+        task = RecieveTask(1)
+        yield task, self.connection
         self._logger.info("Status request is read")
         send_data = "\x01"
         if self.client:
@@ -1147,27 +1604,56 @@ class LSClient(WithLogger):
         else:
             self._logger.info("There are no clients, send false")
             send_data = "\x00"
-        task = SendTask(send_data)
-        task.run(self.connection)
+
+    @connection_task
+    def _send_status(self, data):
+        task = SendTask(data)
+        yield task, self.connection
 
     def _setup_client(self):
         return True
 
+    @connection_task
     def _read_stage_header(self):
         self._logger.info("Start reading stager")
-        task = RecieveTask(4, self._read_stage_header_done)
-        task.run(self.connection)
-
-    def _read_stage_header_done(self, data):
-        data_size = struct.unpack("<I", data)[0]
+        task = RecieveTask(4)
+        yield task, self.connection
+        data_size = struct.unpack("<I", task.data)[0]
         self._logger.info("Stager size is %d bytes", data_size)
-        task = RecieveTask(data_size, self._read_stage_done)
-        task.run(self.connection)
+        self._read_stage(data_size)
 
-    def _read_stage_done(self, data):
+    @connection_task
+    def _read_stage(self, stage_size):
+        task = RecieveTask(stage_size)
+        yield task, self.connection
         self._logger.info("Stage read is done")
-        Registrator.instance().add_stager_for_server(self.msf_id, data.get_data())
+        Registrator.instance().add_stager_for_server(self.msf_id, task.data)
         self._read_status()
+
+    @connection_task
+    def _read_tlv_header(self):
+        task = RecieveTask(self.HEADER_SIZE)
+        yield task, self.connection
+        self._logger.debug("PARSE HEADER")
+        header = task.data
+        xor_key = header[:4]
+        pkt_length_binary = xor_bytes(xor_key, header[24:28])
+        pkt_length = struct.unpack('>I', pkt_length_binary)[0]
+        self._logger.info("Packet length %d", pkt_length)
+        #return pkt_length+24, header
+        self._read_tlv_packet(pkt_length)
+
+    @connection_task
+    def _read_tlv_packet(self, packet_size):
+        task = RecieveTask(packet_size)
+        yield task, self.connection
+        MSFClient.LOGGER.info("All data from server is read. Sending to client.")
+        if self.client:
+            self.client.server_put_data(task.data)
+        else:
+            MSFClient.LOGGER.error("Client for server id %s is not found.Dropping data", self.msf_id)
+        self._read_tlv_header()
+
 
 class MSFClient(object):
     HEADER_SIZE = 32
@@ -1438,434 +1924,6 @@ class UDPRequestHandler(BaseRequestHandlerDNS):
 
     def send_data(self, data):
         return self.request[1].sendto(data, self.client_address)
-
-
-class ReactorObject(object):
-    __metaclass__ = ABCMeta
-
-    def __init__(self, fd, reactor):
-        self.fd = fd
-        self.reactor = reactor 
-        self.in_loop = False
-        self.closed = False
-
-    def get_fd(self):
-        return self.fd
-
-    def add_to_loop(self, reactor=None):
-        if reactor:
-            self.reactor = reactor
-
-        if self.reactor:
-            self.reactor._add_to_loop(self)
-            self.in_loop = True
-        else:
-            raise ValueError("Reactor object is not set")
-
-    def _notify(self):
-        if self.reactor:
-            self.reactor._pool()
-
-    def close(self):
-        if self.in_loop:
-            self.reactor._remove_from_loop(self)
-            self.in_loop = False
-
-        if not self.closed:
-            self.fd.close()
-            self.closed = True
-        self.reactor = None
-
-    def _close(self):
-        """
-        Called by reactor when event loop is ended
-        """
-        self.in_loop = False
-        if not self.closed:
-            self.fd.close()
-            self.closed = True
-        self.reactor = None
-
-    @abstractmethod
-    def on_read(self):
-        pass
-
-    @abstractmethod
-    def on_write(self):
-        pass
-
-    @abstractmethod
-    def want_read(self):
-        return False
-
-    @abstractmethod
-    def want_write(self):
-        return False
-
-
-class RConnection(ReactorObject):
-    def __init__(self, sock, reactor=None):
-        super(RConnection, self).__init__(sock, reactor)
-        self.write_queue = deque()
-        self.read_queue = deque()
-    
-    def want_read(self):
-        return len(self.read_queue) != 0
-
-    def want_write(self):
-        return len(self.write_queue) != 0
-
-    def read_data(self, size):
-        return self.fd.recv(size)
-
-    def send_data(self, data):
-        return self.fd.send(data)
-
-    def _get_task(self, q):
-        tsk = None
-        if len(q) != 0:
-            tsk = q[0]
-        return tsk
-
-    def on_read(self):
-        read_task = self._get_task(self.read_queue)
-        if read_task:
-            read_task.on_event(self, RConnectionTask.EVENT_READ)
-
-    def on_write(self):
-        write_task = self._get_task(self.write_queue)
-        if write_task:
-            write_task.on_event(self, RConnectionTask.EVENT_WRITE)
-
-    def append_task(self, task, task_type):
-        if task_type == RConnectionTask.READ_TASK:
-            self.read_queue.append(task)
-        else:
-            self.write_queue.append(task)
-        self._notify()
-
-    def task_done(self, task):
-        print("delete", task)
-        try:
-            self.read_queue.remove(task)
-            self.write_queue.remove(task)
-        except:
-            pass
-
-class RConnectionFactory(object):
-
-    def __init__(self, connection_cls = RConnection):
-        self.connection_cls = connection_cls
-
-    def create_connection(self, sock, address , reactor):
-        print("new connection")
-        connection = self.connection_cls(sock)
-        task = RecieveTask(10)
-        task.run(connection)
-        connection.add_to_loop(reactor)
-        return connection
-
-class RListener(ReactorObject):
-
-    def __init__(self, sock, reactor=None, connection_factory=RConnectionFactory(), **kwargs):
-        print(kwargs, reactor)
-        super(RListener, self).__init__(sock, reactor)
-        self.need_listen = True
-        self.conn_factory = connection_factory
-
-    def want_listen(self):
-        return self.need_listen
-
-    def listen(self):
-        self.fd.listen(1)
-        self.need_listen = False
-
-    def want_read(self):
-        return True
-
-    def want_write(self):
-        return False
-
-    def on_read(self):
-        sock, address = self.fd.accept()
-        print(self.conn_factory)
-        connection = self.conn_factory.create_connection(sock, address, self.reactor)
-        return connection
-
-    def on_write(self):
-        raise RuntimeError("on write have not be happens on listener")
-
-
-class RListenerFactory(object):
-    def __init__(self, connection_factory=RConnectionFactory()):
-        self.connection_factory = connection_factory
-
-    def create_listener(self, sock, addr, port, **kwargs):
-        listener = RListener(sock, connection_factory=self.connection_factory, **kwargs)
-        return listener
-
-
-class FDReactor(object):
-    SELECT_TIMEOUT = 10
-
-    def __init__(self, loop_timeout=FDReactor.SELECT_TIMEOUT):
-        pipe = os.pipe()
-        self.poll_pipe = (os.fdopen(pipe[0], "r", 0), os.fdopen(pipe[1], "w", 0))
-        self.thread = threading.Thread(target=self._loop)
-        self.thread.setDaemon(True)
-        self.shutdown_evt = threading.Event()
-        self.listeners = []
-        self.connections = []
-        self.lock = threading.RLock()
-        self.in_poll = False
-        self.loop_timeout = loop_timeout
-
-    def create_listener(self, addr, port, listener_factory=RListenerFactory(), monitor=True):
-        listener = None
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setblocking(False)
-
-        try:
-            sock.bind((addr, port))
-        except socket.error as e:
-            if e.args[0] == errno.EADDRINUSE:
-                return listener
-            else:
-                raise
-        
-        listener = listener_factory.create_listener(sock, addr, port, reactor=self)
-        if monitor:
-            listener.add_to_loop()
-        return listener
-
-    def start_loop(self):
-        if self.shutdown_evt.is_set():
-            raise RuntimeError("Can't start loop after shutdown")
-
-        self.thread.start()
-
-    def wait_finish(self):
-        try:
-            while self.thread.isAlive():
-                self.thread.join(1)
-        except KeyboardInterrupt:
-            self.shutdown()
-
-    def shutdown(self):
-        self.shutdown_evt.set()
-        self._pool()
-
-    def _add_to_loop(self, obj):
-        if self.shutdown_evt.is_set():
-            return
-
-        with self.lock:
-            if isinstance(obj, RListener):
-                self.listeners.append(obj)
-            elif isinstance(obj, RConnection):
-                self.connections.append(obj)
-            else:
-                raise ValueError("object of type %s is not supported" % type(obj).__name__)
-        self._pool()
-
-    def _remove_from_loop(self, obj):
-        with self.lock:
-            if isinstance(obj, RListener):
-                self.listeners.remove(obj)
-            elif isinstance(obj, RConnection):
-                self.connections.remove(obj)
-            else:
-                raise ValueError("object of type %s is not supported" % type(obj).__name__)
-        self._pool()
-
-    def _pool(self):
-        with self.lock:
-            if not self.in_poll:
-                self.poll_pipe[1].write("\x01")        
-                self.in_poll = True
-
-    def _loop(self):
-        while not self.shutdown_evt.is_set():
-            readers = [self.poll_pipe[0]]
-            writers = []
-            map_fd = {}
-            with self.lock:
-                for l in self.listeners:
-                    if l.want_listen():
-                        l.listen()
-                    if l.want_read():
-                        fd = l.get_fd()
-                        readers.append(fd)
-                        map_fd[fd] = l
-
-                for c in self.connections:
-                    fd = c.get_fd()
-                    if c.want_read():
-                        readers.append(fd)
-                        map_fd[fd] = c
-                    elif c.want_write():
-                        writers.append(fd)
-                        map_fd[fd] = c
-
-            read_lst, write_lst, _ = select.select(readers, writers, readers, self.loop_timeout)
-
-            if read_lst:
-                for read_fd in read_lst:
-                    if read_fd != self.poll_pipe[0]:
-                        map_fd[read_fd].on_read()
-                    else:
-                        read_fd.read(1)
-                        with self.lock:
-                            self.in_poll = False
-
-            if write_lst:
-                for write_fd in write_lst:
-                    map_fd[write_fd].on_write()
-            
-        # cycle id ended.Close connections and clear arrays
-        for l in self.listeners:
-            l._close()
-        for c in self.connections:
-            c._close()
-        self.listeners = []
-        self.connections = []
-        os.close(self.poll_pipe[0])
-        os.close(self.poll_pipe[1])
-
-
-class RConnectionTask(object):
-    EVENT_READ, EVENT_WRITE, EVENT_ERROR = range(3)
-    READ_TASK, WRITE_TASK = task_types = range(2)
-    WORK_F, IS_DONE_F, DONE_F, ERROR_F = func_types = range(10, 14) 
-
-    def __init__(self, task_type):
-        self.connection = None
-        if task_type not in self.task_types:
-            raise ValueError("Bad task type")
-        self.task_type = task_type
-        self.func_set = {}
-        for attr in self.__class__.__dict__.values():
-            if callable(attr) and hasattr(attr, "task_type"):
-                self.func_set[attr.task_type] = attr.__get__(self)
-
-    def _set_func(self, func_type, func):
-        if not func or func_type not in self.func_types:
-            return
-        
-        self.func_set[func_type] = func
-    
-    def _is_bad_event(self, event_type):
-        event_read_task_write = (self.task_type == self.WRITE_TASK) and \
-                                (event_type == self.EVENT_READ)
-        
-        event_write_task_read = (self.task_type == self.READ_TASK) and \
-                                (event_type == self.EVENT_WRITE)
-        
-        return event_read_task_write or event_write_task_read
-
-
-    def on_event(self, connection, event_type):
-        if (event_type == self.EVENT_ERROR) or \
-            self._is_bad_event(event_type) or \
-            (connection != self.connection):
-            self.func_set[self.ERROR_F]()
-            self.connection = None
-            return
-
-        self.func_set[self.WORK_F](connection)
-        if (self.func_set[self.IS_DONE_F]()):
-            connection.task_done(self)
-            self.func_set[self.DONE_F](connection)
-            self.connection = None
-
-    def run(self, connection):
-        if self.connection:
-            raise RuntimeError("This task is already run")
-        connection.append_task(self, self.task_type)
-        self.connection = connection
-
-    @staticmethod
-    def work_f(fn):
-        def f(*args, **kwargs):
-            return fn(*args, **kwargs)
-        f.task_type = RConnectionTask.WORK_F
-        return f
-
-    @staticmethod
-    def error_f(fn):
-        def f(*args, **kwargs):
-            return fn(*args, **kwargs)
-        f.task_type = RConnectionTask.ERROR_F
-        return f
-
-    @staticmethod
-    def is_done_f(fn):
-        def f(*args, **kwargs):
-            return fn(*args, **kwargs)
-        f.task_type = RConnectionTask.IS_DONE_F
-        return f
-
-    @staticmethod
-    def done_f(fn):
-        def f(*args, **kwargs):
-            return fn(*args, **kwargs)
-        f.task_type = RConnectionTask.DONE_F
-        return f
-
-
-class RecieveTask(RConnectionTask):
-    def __init__(self, size, complete_func=None):
-        super(RecieveTask, self).__init__(RConnectionTask.READ_TASK)
-        self.need_read = size
-        self.data = bytearray() 
-        self.complete_func = complete_func
-
-    @RConnectionTask.work_f
-    def _receive_data(self, connection):
-        data = connection.read_data(self.need_read)
-        self.data.extend(data)
-        data_len = len(data)
-        self.need_read -= data_len
-
-    @RConnectionTask.is_done_f
-    def _is_done(self):
-        return (self.need_read <= 0)
-
-    @RConnectionTask.error_f
-    def _on_error(self):
-        print("Error")
-
-    @RConnectionTask.done_f
-    def _done(self, connection):
-        if self.complete_func:
-            self.complete_func(self.data)
-
-
-class SendTask(RConnectionTask):
-    def __init__(self, data):
-        super(SendTask, self).__init__(RConnectionTask.WRITE_TASK)
-        self.data = data
-        self.need_send = len(data)
-        self.idx = 0
-
-    @RConnectionTask.work_f
-    def _send_data(self, connection):
-        num_send = connection.send_data(self.data[self.idx:])
-        self.need_send -= num_send
-        self.idx += num_send 
-
-    @RConnectionTask.is_done_f
-    def _is_done(self):
-        return (self.need_send <= 0)
-
-    @RConnectionTask.error_f
-    def _on_error(self):
-        print("error")
-
-    @RConnectionTask.done_f
-    def _done(self, connection):
-        print("Done")
-        connection.close()
 
 
 class ServerBuilder(object):
