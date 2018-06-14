@@ -1281,75 +1281,117 @@ class StageClient(object):
 
 class SDnsConnector(WithLogger):
     """
-    Socket - DNS _connector service.
+    Socket - DNS connector service.
     """
     def __init__(self):
-        self.socketMap = {}
-        self.dnsMap = {}
+        self.socketClientMap = {}
+        self.dnsClientMap = {}
+        self.lock = threading.RLock()
 
-    def register_socket(self, server_id):
-        proxy = ProxyConnector()
-        self.socketMap.get(server_id, []).append(proxy)
+    def _find_other_connector(self, clientMap, server_id):
+        connector = None
+        with self.lock:
+            clients = clientMap.get(server_id, deque())
+            with ignored(IndexError):
+                client_proxy = clients.popleft()        
+            if client_proxy:
+                connector = client_proxy.connector._create_paired()
+        return connector
+
+    def _update_map(self, clientMap, server_id, proxy):
+        with self.lock:
+            if not proxy.is_paired():
+                clientMap.get(server_id, deque()).append(proxy)
+
+    def register_socket(self, server_id, connection):
+        if len(server_id) == 0 or not connection:
+            raise RuntimeError("Server id or connection is not defined") 
+        proxy = ProxySocket(self._find_other_connector(self.dnsClientMap, server_id))
+        self._update_map(self.socketClientMap, server_id, proxy)
+        return proxy
 
     def register_dns(self, server_id):
-        pass
+        if len(server_id) == 0:
+            raise RuntimeError("Can't register dns client with empty server_id")
+        proxy = ProxyDNS(self._find_other_connector(self.socketClientMap, server_id))
+        self._update_map(self.dnsClientMap, server_id, proxy)
+        return proxy
 
 
 class ProxyConnector(object):
-    __slots__ = ["send_queue", "recv_queue", "send_lock", "recv_lock"]
+    _disconnectObject = list()
 
     def __init__(self):
-        self.send_queue = deque()
-        self.send_lock = threading.RLock()
-        self.recv_queue = deque()
-        self.recv_lock = threading.RLock()
+        self._send_queue = deque()
+        self._send_lock = threading.RLock()
+        self._recv_queue = deque()
+        self._recv_lock = threading.RLock()
+        self._paired = threading.Event()
+        self.on_connected = None
+        self.on_disconnected = None
+
+    def set_on_connect(self, func):
+        self.on_connected = func
+
+    def set_on_disconnect(self, func):
+        self.on_disconnected = func
 
     def send(self, packet):
-        self.send_queue.put(packet)
+        with self._send_lock:
+            self._send_queue.append(packet)
 
     def receive(self):
         data = None
-        with ignored(Queue.Empty):
-            data = self.recv_queue.get_nowait()
+        with self._recv_lock, ignored(IndexError):
+            data = self._recv_queue.popleft()
+        if data == self._disconnectObject:
+            self._paired.clear()
+            if self.on_disconnected:
+                self.on_disconnected()
+            data = None
         return data
 
-    def create_paired(self):
+    def disconnect(self):
+        self.send(self._disconnectObject)
+        self._paired.clear()
+
+    def _create_paired(self):
         paired = ProxyConnector()
-        paired.is_paired.set()
-        self.is_paired.set()
-
-    def change_queue(self, send_queue, recv_queue):
-        self.send_queue = send_queue
-        self.recv_queue = recv_queue
-
-
-def create_pair_connector(size=16):
-    first_queue = Queue.Queue(size)
-    second_queue = Queue.Queue(size)
-    first_proxy = ProxyConnector(first_queue, second_queue)
-    second_proxy = ProxyConnector(second_queue, first_proxy) 
-    return first_proxy, second_proxy
+        paired._send_queue = self._recv_queue
+        paired._send_lock = self._recv_lock
+        paired._recv_queue = self._send_queue
+        paired._recv_lock = self._send_lock
+        paired._paired.set()
+        self._paired.set()
+        if self.on_connected:
+            self.on_connected()
 
 
-class AbstractProxy(object):
-    __metaclass__ = ABCMeta
+class BaseProxy(object):
 
     def __init__(self, connector=None):
-        self.connector = connector or ProxyConnector()
+        self._connector = connector or ProxyConnector()
 
-    def create_paired_connector():
-        self.connector.create_paired()
+    def is_paired(self):
+        return self._connector._paired.isSet()
+    
+    def notify_on_connect(self, func):
+        self._connector.set_on_connect(func)
 
-    @abstractmethod
+    def notify_on_disconnect(self, func):
+        self._connector.set_on_disconnect(func)
+
     def send(self, data):
-        self.connector.send(data)
+        self._connector.send(data)
 
-    @abstractmethod
     def receive(self):
-        return self.connector.receive()
+        return self._connector.receive()
+
+    def disconnect(self):
+        self._connector.disconnect()
 
 
-class ProxySocket(AbstractProxy):
+class ProxySocket(BaseProxy):
     
     def __init__(self, connector=None):
         super(ProxySocket, self).__init__(connector)
@@ -1361,7 +1403,7 @@ class ProxySocket(AbstractProxy):
         data = super(ProxySocket.self).receive()
         return data
 
-class ProxyDNS(AbstractProxy):
+class ProxyDNS(BaseProxy):
 
     def __init__(self, connector=None):
         super(ProxySocket, self).__init__(connector)
