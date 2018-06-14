@@ -1296,11 +1296,13 @@ class SDnsConnector(WithLogger):
 
 
 class ProxyConnector(object):
-    __slots__ = ["send_queue", "recv_queue"]
+    __slots__ = ["send_queue", "recv_queue", "send_lock", "recv_lock"]
 
-    def __init__(self, send_q=Queue.Queue(16), recv_q=Queue.Queue(16)):
-        self.send_queue = send_q
-        self.recv_queue = recv_q
+    def __init__(self):
+        self.send_queue = deque()
+        self.send_lock = threading.RLock()
+        self.recv_queue = deque()
+        self.recv_lock = threading.RLock()
 
     def send(self, packet):
         self.send_queue.put(packet)
@@ -1312,7 +1314,9 @@ class ProxyConnector(object):
         return data
 
     def create_paired(self):
-        return ProxyConnector(self.recv_queue, self.send_queue)
+        paired = ProxyConnector()
+        paired.is_paired.set()
+        self.is_paired.set()
 
     def change_queue(self, send_queue, recv_queue):
         self.send_queue = send_queue
@@ -1325,6 +1329,49 @@ def create_pair_connector(size=16):
     first_proxy = ProxyConnector(first_queue, second_queue)
     second_proxy = ProxyConnector(second_queue, first_proxy) 
     return first_proxy, second_proxy
+
+
+class AbstractProxy(object):
+    __metaclass__ = ABCMeta
+
+    def __init__(self, connector=None):
+        self.connector = connector or ProxyConnector()
+
+    def create_paired_connector():
+        self.connector.create_paired()
+
+    @abstractmethod
+    def send(self, data):
+        self.connector.send(data)
+
+    @abstractmethod
+    def receive(self):
+        return self.connector.receive()
+
+
+class ProxySocket(AbstractProxy):
+    
+    def __init__(self, connector=None):
+        super(ProxySocket, self).__init__(connector)
+
+    def send(self, data):
+        super(ProxySocket, self).send(data)
+
+    def receive(self):
+        data = super(ProxySocket.self).receive()
+        return data
+
+class ProxyDNS(AbstractProxy):
+
+    def __init__(self, connector=None):
+        super(ProxySocket, self).__init__(connector)
+
+    def send(self, data):
+        super(ProxySocket, self).send(data)
+
+    def receive(self):
+        data = super(ProxySocket.self).receive()
+        return data
 
 
 class Request(WithLogger):
