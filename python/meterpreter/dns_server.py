@@ -141,6 +141,10 @@ class ReactorObject(object):
             self.closed = True
         self.reactor = None
 
+    def add_deffered_task(self, task):
+        if self.reactor:
+            self.reactor.put_task(task)
+
     @abstractmethod
     def on_read(self):
         pass
@@ -857,25 +861,18 @@ class BlockSizedData(object):
         return self.data_size
 
 
-class Registrator(object):
-    __instance = None
+class Registrator(WithLogger):
     CLIENT_TIMEOUT = 40
 
-    @staticmethod
-    def instance():
-        if not Registrator.__instance:
-            Registrator.__instance = Registrator()
-        return Registrator.__instance
-
-    def __init__(self):
+    def __init__(self, connector):
         self.id_list = [chr(i) for i in range(ord('a'), ord('z')+1)]
+        self.connector = connector
         self.clientMap = {}
         self.servers = {}
         self.stagers = {}
         self.waited_servers = {}
         self.unregister_list = []
         self.lock = threading.Lock()
-        self.logger = logging.getLogger(self.__class__.__name__)
         self.default_stager = StageClient()
         self.timeout_service = TimeoutService(timeout=20)
         self.timeout_service.add_callback(self.on_timeout)
@@ -884,10 +881,9 @@ class Registrator(object):
         self.timeout_service.remove_callback(self.on_timeout)
 
     def register_client_for_server(self, server_id, client):
-        self.logger.info("Register client(%s) for server '%s'", client.get_id(), server_id)
+        self._logger.info("Register client(%s) for server '%s'", client.get_id(), server_id)
         with self.lock:
-            self.servers.setdefault(server_id, []).append(client)
-        self._notify_waited_servers(server_id)
+            return self.connector.register_dns(server_id)
 
     def request_client_id(self, client):
         client_id = None
@@ -896,62 +892,27 @@ class Registrator(object):
                 client_id = self.id_list.pop(0)
                 self.clientMap[client_id] = client
             except IndexError:
-                self.logger.error("Can't find free id for new client.", exc_info=True)
+                self._logger.error("Can't find free id for new client.", exc_info=True)
                 return None
         return client_id
-
-    def _notify_waited_servers(self, server_id):
-        notify_server = None
-        with self.lock:
-            waited_lst = self.waited_servers.get(server_id, [])
-            if waited_lst:
-                notify_server = waited_lst.pop(0)
-                if not waited_lst:
-                    del self.waited_servers[server_id]
-        if notify_server:
-            self.logger.info("Notify server(%s)", notify_server)
-            notify_server.on_new_client()
-
-    def subscribe(self, server_id, server):
-        with self.lock:
-            self.waited_servers.setdefault(server_id, []).append(server)
-        self.logger.info("Subscription is done for server with %s id.", server_id)
-
-    def unsubscribe(self, server_id, server):
-        with self.lock:
-            waited_lst = self.waited_servers.get(server_id, [])
-            if waited_lst:
-                with ignored(ValueError):
-                    waited_lst.remove(server)
-        self.logger.info("Unsubscription is done for server with %s id.", server_id)
 
     def get_client_by_id(self, client_id):
         with self.lock:
             with ignored(KeyError):
                 return self.clientMap[client_id]
 
-    def get_new_client_for_server(self, server_id):
-        self.logger.info("Looking for clients...")
-        with self.lock:
-            with ignored(IndexError):
-                clients = self.servers.get(server_id, [])
-                assigned_client = clients.pop(0)
-                if not clients:
-                    del self.servers[server_id]
-                return assigned_client
-
     def get_stage_client_for_server(self, server_id):
         with self.lock:
             try:
                 return self.stagers[server_id]
             except KeyError:
-                self.logger.info("Trying to request stager for server with %s id", server_id)
+                self._logger.info("Trying to request stager for server with %s id", server_id)
                 waited_lst = self.waited_servers.get(server_id, [])
                 if waited_lst:
                     server = waited_lst[0]
                     server.request_stage()
                 else:
-                    self.logger.info("Server list is empty")
+                    self._logger.info("Server list is empty")
                 return self.default_stager
 
     def add_stager_for_server(self, server_id, data):
@@ -967,7 +928,7 @@ class Registrator(object):
             with ignored(KeyError):
                 del self.clientMap[client_id]
                 self.id_list.append(client_id)
-                self.logger.error("Unregister client with id %s successfully", client_id)
+                self._logger.error("Unregister client with id %s successfully", client_id)
 
     def unregister_client(self, client_id, pending=True):
         if pending:
@@ -988,7 +949,7 @@ class Registrator(object):
             for client_id in ids_for_remove:
                 del self.clientMap[client_id]
                 self.id_list.append(client_id)
-                self.logger.info("Unregister client with '%s' id(reason: timeout)", client_id)
+                self._logger.info("Unregister client with '%s' id(reason: timeout)", client_id)
 
             ids_for_remove = [server_id for server_id, client in self.stagers.iteritems()
                               if abs(client.ts - cur_time) >= self.CLIENT_TIMEOUT * 4]
@@ -997,7 +958,7 @@ class Registrator(object):
                 waiters = self.waited_servers.get(server_id, [])
                 if not waiters:
                     del self.stagers[server_id]
-                    self.logger.info("Clearing stager client for server with '%s' id(reason: timeout)", server_id)
+                    self._logger.info("Clearing stager client for server with '%s' id(reason: timeout)", server_id)
 
             unregister_list = []
             for client_id in self.unregister_list:
@@ -1006,7 +967,7 @@ class Registrator(object):
                     if client.is_idle():
                         del self.clientMap[client_id]
                         self.id_list.append(client_id)
-                        self.logger.info("Unregister client with '%s' id", client_id)
+                        self._logger.info("Unregister client with '%s' id", client_id)
                     else:
                         unregister_list.append(client_id)
 
@@ -1073,7 +1034,7 @@ class Client(WithLogger):
     INITIAL = 1
     INCOMING_DATA = 2
 
-    def __init__(self, domain):
+    def __init__(self, domain, registrator):
         self.domain = domain
         self.state = self.INITIAL
         self.received_data = PartedData()
@@ -1085,9 +1046,10 @@ class Client(WithLogger):
         self.server = None
         self.client_id = None
         self.server_id = None
-        self.register_for_server_needed = False
         self.ts = 0
         self.lock = threading.Lock()
+        self.registrator = registrator
+        self.proxy = None
 
     def update_last_request_ts(self):
         self.ts = int(time.time())
@@ -1099,11 +1061,10 @@ class Client(WithLogger):
             return not self.server and not self.received_data.is_complete() 
 
     def register_client(self, server_id, encoder):
-        client_id = Registrator.instance().request_client_id(self)
+        client_id = self.registrator.request_client_id(self)
         if client_id:
             self.client_id = client_id
             self.server_id = server_id
-            self.register_for_server_needed = True
             self._logger.info("Registered new client with %s id for server_id %s", client_id, server_id)
             return encoder.encode_registration(client_id, 0)
         else:
@@ -1182,14 +1143,13 @@ class Client(WithLogger):
 
     def request_data_header(self, sub_domain, encoder):
         if sub_domain == self.sub_domain:
-            if self.register_for_server_needed:
-                Registrator.instance().register_client_for_server(self.server_id, self)
-                self.register_for_server_needed = False
+            if not self.proxy:
+                self.registrator.register_client_for_server(self.server_id, self)
 
             if not self.send_data:
-                with ignored(Queue.Empty):
-                    self._logger.info("Checking client queue...")
-                    data = self.client_queue.get_nowait()
+                self._logger.info("Checking client queue...")
+                data = self.proxy.receive()
+                if data:
                     self.send_data = BlockSizedData(data, encoder.MAX_PACKET_SIZE)
                     self._logger.debug("New data found: size is %d", len(data))
 
@@ -1226,24 +1186,10 @@ class Client(WithLogger):
         except ValueError:
             self._logger.error("request_data: index(%d) out of range.", index)
 
-    def server_put_data(self, data):
-        self._logger.info("Server adds data to queue.")
-        self.client_queue.put(data)
-
-    def server_get_data(self, timeout=2):
-        self._logger.info("Checking server queue...")
-        with ignored(Queue.Empty):
-            data = self.server_queue.get(True, timeout)
-            self._logger.info("There are new data(length=%d) for the server", len(data))
-            return data
-
-    def server_has_data(self):
-        return not self.server_queue.empty()
-
     def on_timeout(self):
-        if self.server:
-            self.server.on_client_timeout()
-            self.server = None
+        if self.proxy:
+            self.proxy.close()
+            self.proxy = None
 
     def get_domain(self):
         return self.domain
@@ -1301,12 +1247,12 @@ class SDnsConnector(WithLogger):
     def _update_map(self, clientMap, server_id, proxy):
         with self.lock:
             if not proxy.is_paired():
-                clientMap.get(server_id, deque()).append(proxy)
+                clientMap.setdefault(server_id, deque()).append(proxy)
 
-    def register_socket(self, server_id, connection):
-        if len(server_id) == 0 or not connection:
+    def register_socket(self, server_id, client):
+        if len(server_id) == 0 or not client:
             raise RuntimeError("Server id or connection is not defined") 
-        proxy = ProxySocket(self._find_other_connector(self.dnsClientMap, server_id))
+        proxy = ProxySocket(client, self._find_other_connector(self.dnsClientMap, server_id))
         self._update_map(self.socketClientMap, server_id, proxy)
         return proxy
 
@@ -1318,14 +1264,33 @@ class SDnsConnector(WithLogger):
         return proxy
 
 
+class LQueue(object):
+
+    def __init__(self):
+        self.deque = deque()
+        self.lock = threading.RLock()
+        self.on_new_data = None
+
+    def append(self, data):
+        with self.lock:
+            self.deque.append(data)
+        if self.on_new_data:
+            self.on_new_data()
+
+    def pop(self):
+        with self.lock, ignored(IndexError):
+            self.deque.popleft()
+
+    def attach_callback(self, callback):
+        self.on_new_data = callback
+
+
 class ProxyConnector(object):
     _disconnectObject = list()
 
     def __init__(self):
-        self._send_queue = deque()
-        self._send_lock = threading.RLock()
-        self._recv_queue = deque()
-        self._recv_lock = threading.RLock()
+        self._send_queue = LQueue()
+        self._recv_queue = LQueue()
         self._paired = threading.Event()
         self.on_connected = None
         self.on_disconnected = None
@@ -1337,14 +1302,11 @@ class ProxyConnector(object):
         self.on_disconnected = func
 
     def send(self, packet):
-        with self._send_lock:
-            self._send_queue.append(packet)
+        self._send_queue.append(packet)
 
     def receive(self):
-        data = None
-        with self._recv_lock, ignored(IndexError):
-            data = self._recv_queue.popleft()
-        if data == self._disconnectObject:
+        data = self._recv_queue.pop()
+        if id(data) == id(self._disconnectObject):
             self._paired.clear()
             if self.on_disconnected:
                 self.on_disconnected()
@@ -1358,13 +1320,14 @@ class ProxyConnector(object):
     def _create_paired(self):
         paired = ProxyConnector()
         paired._send_queue = self._recv_queue
-        paired._send_lock = self._recv_lock
         paired._recv_queue = self._send_queue
-        paired._recv_lock = self._send_lock
         paired._paired.set()
         self._paired.set()
         if self.on_connected:
             self.on_connected()
+
+    def _attach_queue_callback(self, callback):
+        self._recv_queue.attach_callback(callback)
 
 
 class BaseProxy(object):
@@ -1393,27 +1356,17 @@ class BaseProxy(object):
 
 class ProxySocket(BaseProxy):
     
-    def __init__(self, connector=None):
+    def __init__(self, client, connector=None):
         super(ProxySocket, self).__init__(connector)
+        self._client = client
+        self._connector._attach_queue_callback(self._notify)
 
-    def send(self, data):
-        super(ProxySocket, self).send(data)
+    def _notify(self):
+        self._client._notify_new_data()
 
-    def receive(self):
-        data = super(ProxySocket.self).receive()
-        return data
 
 class ProxyDNS(BaseProxy):
-
-    def __init__(self, connector=None):
-        super(ProxySocket, self).__init__(connector)
-
-    def send(self, data):
-        super(ProxySocket, self).send(data)
-
-    def receive(self):
-        data = super(ProxySocket.self).receive()
-        return data
+    pass
 
 
 class Request(WithLogger):
@@ -1426,7 +1379,7 @@ class Request(WithLogger):
             return cls.EXPR.match(qname)
 
     @classmethod
-    def handle(cls, qname, domain, dns_cls):
+    def handle(cls, qname, domain, dns_cls. registrator):
         m = cls.match(qname)
         if not m:
             return None
@@ -1436,10 +1389,10 @@ class Request(WithLogger):
         if not client_id:
             if "new_client" in cls.OPTIONS:
                 Request._logger.info("Create a new client.")
-                client = Client(domain)
+                client = Client(domain, registrator)
         else:
-            client = Registrator.instance().get_stage_client_for_server(client_id) if "stage_client" in cls.OPTIONS else \
-                     Registrator.instance().get_client_by_id(client_id)
+            client = registrator.get_stage_client_for_server(client_id) if "stage_client" in cls.OPTIONS else \
+                     registrator.get_client_by_id(client_id)
 
         if client:
             client_domain = client.get_domain()
@@ -1719,6 +1672,7 @@ class DnsServer(WithLogger):
         for record in self.domains[domain].get_records(sub_domain, DomainDB.DNSKEY_TYPE):
             reply.add_answer(RR(rname=qname, rtype=QTYPE.DNSKEY, rclass=1, ttl=1, rdata=record))
 
+
 def dns_response(data, transport):
     try:
         request = DNSRecord.parse(data)
@@ -1763,7 +1717,7 @@ class LSClient(WithLogger):
 
     HEADER_SIZE = 32
     
-    def __init__(self, connection, registrator=Registrator.instance()):
+    def __init__(self, connection, connector):
         self.connection = connection
         # enable keep-alive every minute
         self.connection.set_options(socket.SOL_SOCKET, {socket.SO_KEEPALIVE : 1})
@@ -1773,27 +1727,38 @@ class LSClient(WithLogger):
             socket.TCP_KEEPINTVL: 15
         })
         self.msf_id = ""
-        self.client = None
-        self.registrator = registrator
+        self.connector = connector
         self._read_id_size()
         self.stage_requested = False
-        self.wait_client = False
+        self.proxy = None
 
     def _connection_error(self):
         self._logger.info("Error or closed connection")
-        if self.client:
-            client_id = self.client.get_id()
-            if client_id:
-                self._logger.info("Unregister client with id %s", client_id)
-                self.registrator.unregister_client(client_id)
-            self.client.set_server(None)
-            self.client = None
-        self.registrator.unsubscribe(self.msf_id, self)
+        if self.proxy:
+            self.proxy.close()
+            self.proxy = None
 
     def _create_receive_task(self, size):
         task = ReceiveTask(size)
         task.set_error_func(self._connection_error)
         return task
+
+    def _new_proxy_data(self):
+        if self.proxy:
+            data = self.proxy.receive()
+            if data:
+                send_task = SendTask(data)
+                send_task.run(self.connection)
+
+    def _notify_new_data(self):
+        task = DefferedTask(self._new_proxy_data)
+        self.connection.add_deffered_task(task)
+
+    def _on_new_client(self):
+        self._logger.info("Association with DNS client is done")
+
+    def _on_closed_client(self):
+        self._logger.info("DNS client is disconnected")
 
     @connection_task
     def _read_id_size(self):
@@ -1809,14 +1774,14 @@ class LSClient(WithLogger):
         yield task, self.connection
         self.msf_id = task.data.decode()
         self._logger.info("Got id = %s", self.msf_id)
-        if self._setup_client():
+        self.proxy = self.connector.register_socket(self.msf_id, self)
+        self.proxy.notify_on_connect(self._on_new_client)
+        self.proxy.notify_on_disconnect(self._on_closed_client)
+        if self.proxy.is_paired():
             self._logger.info("New client is found.")
             self._read_status()
         else:
-            self._logger.info("There are no clients for server id %s. Create subscription",
-                                  self.msf_id)
-            self.wait_client = True
-            self.registrator.subscribe(self.msf_id, self)
+            self._logger.info("There are no clients for server id %s.", self.msf_id)
 
     @connection_task
     def _read_status(self):
@@ -1824,13 +1789,9 @@ class LSClient(WithLogger):
         yield task, self.connection
         self._logger.info("Status request is read")
         send_data = "\x01"
-        if self.client:
+        if self.proxy.is_paired():
             self._logger.info("Client is exists, send true")
             self._read_tlv_header()
-        elif self._setup_client():
-            self._logger.info("New client is found, send true")
-            self._read_tlv_header()
-            self.wait_client = False
         else:
             self._logger.info("There are no clients, send false")
             send_data = "\x00"
@@ -1840,19 +1801,6 @@ class LSClient(WithLogger):
     def _send_status(self, data):
         task = SendTask(data)
         yield task, self.connection
-
-    def _setup_client(self):
-        if not self.msf_id:
-            self._logger.error("There are no msf id!!!")
-            return False
-        client = self.registrator.get_new_client_for_server(self.msf_id)
-        if client:
-            self.client = client
-            client.set_server(self)
-            self._logger.info("Association client-server is done successfully(%s(%s)<->%s)",
-                                   self.msf_id, str(self), self.client.get_id())
-            return True
-        return False
 
     @connection_task
     def _read_stage_header(self):
@@ -1868,7 +1816,7 @@ class LSClient(WithLogger):
         task = self._create_receive_task(stage_size)
         yield task, self.connection
         self._logger.info("Stage read is done")
-        self.registrator.add_stager_for_server(self.msf_id, data+task.data)
+        # self.registrator.add_stager_for_server(self.msf_id, data+task.data)
         self._read_status()
 
     @connection_task
@@ -1887,57 +1835,31 @@ class LSClient(WithLogger):
     def _read_tlv_packet(self, packet_size, data):
         task = self._create_receive_task(packet_size)
         yield task, self.connection
-        self._logger.info("All data from server is read. Sending to client.")
-        if self.client:
-            self.client.server_put_data(data + task.data)
-        else:
-            self._logger.error("Client for server id %s is not found.Dropping data", self.msf_id)
+        self._logger.info("All data from socket is read. Sending to client.")
+        self.proxy.send(data + task.data)
         self._read_tlv_header()
-
-    def on_client_timeout(self):
-        self._logger.info("Closing connection.(client timeout)")
-        self.client = None
-        self.connection.close()
-
-    def on_new_client(self):
-        if not self.client:
-            if self._setup_client():
-                self._read_status()
-                self.registrator.unsubscribe(self.msf_id, self)
-                self.wait_client = False
-        else:
-            self._logger.error("Client already exists for this server")
 
     def request_stage(self):
         if not self.stage_requested:
             self._read_stage_header()
             self.stage_requested = True
-            self.wait_client = False
         else:
             self._logger.info("Stage has already was requested on this server")
     
     def polling(self):
         self.connection._notify()
 
-    def _new_data(self, queue):
-        with ignored(Queue.Empty):
-            data = queue.get_nowait()
-            task = SendTask(data)
-            task.run(self.connection)
-
-    def get_new_data_task(self, queue):
-        return = DefferedTask(self._new_data, queue)
-
 
 class MSFConnectionFactory(RConnectionFactory):
-    def __init__(self):
+    def __init__(self, connector):
         super(MSFConnectionFactory, self).__init__()
+        self.connector = connector
         self.clients = []
 
     def create_connection(self, sock, address, reactor):
         self._logger.info("New incoming connection from address %s", address)
         connection = super(MSFConnectionFactory, self).create_connection(sock, address, reactor)
-        client = LSClient(connection, registrator=Registrator.instance())
+        client = LSClient(connection, self.connector)
         self.clients.append(client)
         return connection
 
@@ -1996,8 +1918,9 @@ class ServerBuilder(object):
         start_dns_task = DefferedTask(DnsServer.create, args.domain, dns_addr if dns_addr else args.ipaddr)
         self._append_to_seq(start_dns_task)
 
+        connector = SDnsConnector()
         msf_addr, msf_port = self._parse_addr_port(args.laddr)
-        listener_factory = RListenerFactory(connection_factory=MSFConnectionFactory())
+        listener_factory = RListenerFactory(connection_factory=MSFConnectionFactory(connector))
         listener_task = DefferedTask(reactor.create_listener, msf_addr if msf_addr else '0.0.0.0', msf_port, listener_factory=listener_factory)
         self._append_to_seq(listener_task)
 
