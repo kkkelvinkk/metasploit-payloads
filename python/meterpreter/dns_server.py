@@ -1039,9 +1039,6 @@ class Client(WithLogger):
         self.last_received_index = -1
         self.sub_domain = "aaaa"
         self.send_data = None
-        self.server_queue = Queue.Queue()
-        self.client_queue = Queue.Queue()
-        self.server = None
         self.client_id = None
         self.server_id = None
         self.ts = 0
@@ -1083,10 +1080,6 @@ class Client(WithLogger):
         self.received_data.reset()
         self.last_received_index = -1
         self.padding = 0
-
-    def set_server(self, server):
-        with self.lock:
-            self.server = server
 
     def incoming_data_header(self, data_size, padding, encoder):
         if self.received_data.get_expected_size() == data_size and self.state == self.INCOMING_DATA:
@@ -1153,7 +1146,7 @@ class Client(WithLogger):
                 sub_domain = next_sub
                 data_size = self.send_data.get_size()
             else:
-                self._logger.info("No data for client.(%s)", "server" if self.server else "no server")
+                self._logger.info("No data for client.")
             self._logger.info("Send data header to client with domain %s and size %d", sub_domain, data_size)
             return encoder.encode_data_header(sub_domain, data_size)
         else:
@@ -1361,6 +1354,18 @@ class ProxySocket(BaseProxy):
 
 class ProxyDNS(BaseProxy):
     pass
+
+
+class StagerKeeper(WithLogger):
+
+    def __init__(self):
+        self.stagerMap = {}
+
+    def set_stager(self, server_id, data):
+        self.stagerMap[server_id] = StageClient(data) 
+
+    def get_stager(self, server_id):
+        return self.stagerMap.get(server_id, StageClient())
 
 
 class Request(WithLogger):
