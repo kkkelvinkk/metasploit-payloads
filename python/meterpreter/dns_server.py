@@ -36,7 +36,7 @@ DNS_LOG_NAME = "dns.log"
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
 # add handler to the root logger
-formatter = logging.Formatter("%(asctime)s %(name)-24s %(levelname)-8s %(message)s")
+formatter = logging.Formatter("%(asctime)s %(thread)d %(name)-24s %(levelname)-8s %(message)s")
 # rotating log file after 5 MB
 handler = RotatingFileHandler(DNS_LOG_NAME, maxBytes=5*1024*1024, backupCount=5)
 handler.setFormatter(formatter)
@@ -431,7 +431,8 @@ class FDReactor(WithLogger):
             with self.task_lock:
                 for tsk in self.tasks:
                     tsk.run()
-            
+                self.tasks = []
+        
         # cycle id ended.Close connections and clear arrays
         for l in self.listeners:
             l._close()
@@ -544,7 +545,6 @@ class ReceiveTask(RConnectionTask):
         data = connection.read_data(self.need_read)
         self.data.extend(data)
         data_len = len(data)
-        print("Length", data_len)
         self.need_read -= data_len
 
     @RConnectionTask.is_done_f
@@ -571,7 +571,6 @@ class SendTask(RConnectionTask):
     @RConnectionTask.work_f
     def _send_data(self, connection):
         num_send = connection.send_data(self.data[self.idx:])
-        print(num_send)
         self.need_send -= num_send
         self.idx += num_send 
 
@@ -586,7 +585,6 @@ class SendTask(RConnectionTask):
     @RConnectionTask.done_f
     def _done(self, connection):
         pass
-
 
 def connection_task(func):
     if not callable(func):
@@ -1102,7 +1100,7 @@ class Client(WithLogger):
         return encoder.encode_ready_receive()
 
     def incoming_data(self, data, index, counter, encoder):
-        self.logger.debug("Data %s, index %d", data, index)
+        self._logger.debug("Data %s, index %d", data, index)
         if self.state != self.INCOMING_DATA:
             self._logger.error("Bad state(%d) for this action. Send finish.", self.state)
             return encoder.encode_finish_send()
@@ -1129,12 +1127,8 @@ class Client(WithLogger):
             try:
                 packet = base64.b32decode(self.received_data.get_data() + "=" * self.padding, True)
                 self._logger.info("Put decoded data to the server queue")
-                self.server_queue.put(packet)
+                self.proxy.send(packet)
                 self._initial_state()
-                if self.server:
-                    self._logger.info("Notify server")
-                    task = self.server.get_new_data_task(self.server_queue)
-                    self.reactor.put_task(task)
             except Exception:
                 self._logger.error("Error during decode received data", exc_info=True)
                 self._initial_state()
@@ -1144,7 +1138,7 @@ class Client(WithLogger):
     def request_data_header(self, sub_domain, encoder):
         if sub_domain == self.sub_domain:
             if not self.proxy:
-                self.registrator.register_client_for_server(self.server_id, self)
+                self.proxy = self.registrator.register_client_for_server(self.server_id, self)
 
             if not self.send_data:
                 self._logger.info("Checking client queue...")
@@ -1188,7 +1182,7 @@ class Client(WithLogger):
 
     def on_timeout(self):
         if self.proxy:
-            self.proxy.close()
+            self.proxy.disconnect()
             self.proxy = None
 
     def get_domain(self):
@@ -1236,12 +1230,13 @@ class SDnsConnector(WithLogger):
 
     def _find_other_connector(self, clientMap, server_id):
         connector = None
+        client_proxy = None
         with self.lock:
             clients = clientMap.get(server_id, deque())
             with ignored(IndexError):
                 client_proxy = clients.popleft()        
             if client_proxy:
-                connector = client_proxy.connector._create_paired()
+                connector = client_proxy._connector._create_paired()
         return connector
 
     def _update_map(self, clientMap, server_id, proxy):
@@ -1279,18 +1274,18 @@ class LQueue(object):
 
     def pop(self):
         with self.lock, ignored(IndexError):
-            self.deque.popleft()
+            return self.deque.popleft()
 
     def attach_callback(self, callback):
         self.on_new_data = callback
 
 
-class ProxyConnector(object):
+class ProxyConnector(WithLogger):
     _disconnectObject = list()
 
-    def __init__(self):
-        self._send_queue = LQueue()
-        self._recv_queue = LQueue()
+    def __init__(self, send_queue=None, recv_queue=None):
+        self._send_queue = send_queue or LQueue()
+        self._recv_queue = recv_queue or LQueue()
         self._paired = threading.Event()
         self.on_connected = None
         self.on_disconnected = None
@@ -1318,13 +1313,12 @@ class ProxyConnector(object):
         self._paired.clear()
 
     def _create_paired(self):
-        paired = ProxyConnector()
-        paired._send_queue = self._recv_queue
-        paired._recv_queue = self._send_queue
+        paired = ProxyConnector(self._recv_queue, self._send_queue)
         paired._paired.set()
         self._paired.set()
         if self.on_connected:
             self.on_connected()
+        return paired
 
     def _attach_queue_callback(self, callback):
         self._recv_queue.attach_callback(callback)
@@ -1379,7 +1373,7 @@ class Request(WithLogger):
             return cls.EXPR.match(qname)
 
     @classmethod
-    def handle(cls, qname, domain, dns_cls. registrator):
+    def handle(cls, qname, domain, dns_cls, registrator):
         m = cls.match(qname)
         if not m:
             return None
@@ -1501,7 +1495,7 @@ class DNSTunnelRequestHandler(WithLogger):
             IncomingNewClient
         ]
 
-    def process_request(self, sub_domain, domain):
+    def process_request(self, sub_domain, domain, registrator):
         result = []
         if not sub_domain:
             self._logger.error("Bad request: subdomain is empty %s", str(sub_domain))
@@ -1509,7 +1503,7 @@ class DNSTunnelRequestHandler(WithLogger):
 
         self._logger.info("requested subdomain name is %s", sub_domain)
         for handler in self.handlers_chain:
-            answer = handler.handle(sub_domain, domain, self.__class__)
+            answer = handler.handle(sub_domain, domain, self.__class__, registrator)
             if answer:
                 self._logger.debug("Request for %s is handled successfully", sub_domain)
                 result = answer
@@ -1544,11 +1538,11 @@ class DomainDB(object):
         def get(self, r_type):
             return self.records.get(r_type, [])
 
-    def __init__(self, domain):
+    def __init__(self, domain, registrator):
         self.domain = domain
+        self.registrator = registrator
         self.static_records = {}
         self.wildcard_records = DomainDB.Records()
-        self.logger = logging.getLogger(self.__class__.__name__)
         self.dynamic_handlers = {
             DomainDB.AAAA_TYPE : self._get_aaaa_records,
             DomainDB.DNSKEY_TYPE: self._get_dnskey_records
@@ -1584,29 +1578,29 @@ class DomainDB(object):
         return result
 
     def _get_aaaa_records(self, name):
-        return self.aaaa_handler.process_request(name, self.domain)
+        return self.aaaa_handler.process_request(name, self.domain, self.registrator)
 
     def _get_dnskey_records(self, name):
-        return self.dnskey_handler.process_request(name, self.domain)
+        return self.dnskey_handler.process_request(name, self.domain, self.registrator)
 
 
 class DnsServer(WithLogger):
     __instance = None
 
     @staticmethod
-    def create(domains, ipv4):
+    def create(domains, ipv4, registrator):
         if not DnsServer.__instance:
-            DnsServer.__instance = DnsServer(domains, ipv4)
+            DnsServer.__instance = DnsServer(domains, ipv4, registrator)
 
     @staticmethod
     def instance():
         return DnsServer.__instance
 
-    def __init__(self, domains, ipv4):
+    def __init__(self, domains, ipv4, registrator):
         self.domains = {}
         for domain in domains:
             domain += "."
-            db = DomainDB(domain)
+            db = DomainDB(domain, registrator)
             db.append_record("*", DomainDB.NS_TYPE, "ns1." + domain)
             db.append_record("*", DomainDB.NS_TYPE, "ns2." + domain)
             db.append_record("*", DomainDB.A_TYPE, ipv4)
@@ -1756,9 +1750,11 @@ class LSClient(WithLogger):
 
     def _on_new_client(self):
         self._logger.info("Association with DNS client is done")
+        self._read_status()
 
     def _on_closed_client(self):
         self._logger.info("DNS client is disconnected")
+        self.connection.close()
 
     @connection_task
     def _read_id_size(self):
@@ -1781,7 +1777,7 @@ class LSClient(WithLogger):
             self._logger.info("New client is found.")
             self._read_status()
         else:
-            self._logger.info("There are no clients for server id %s.", self.msf_id)
+            self._logger.info("There are no clients for server id %s. Waiting", self.msf_id)
 
     @connection_task
     def _read_status(self):
@@ -1821,6 +1817,7 @@ class LSClient(WithLogger):
 
     @connection_task
     def _read_tlv_header(self):
+        self._logger.info("Reading tlv header")
         task = self._create_receive_task(self.HEADER_SIZE)
         yield task, self.connection
         self._logger.debug("Parsing tlv header")
@@ -1845,9 +1842,6 @@ class LSClient(WithLogger):
             self.stage_requested = True
         else:
             self._logger.info("Stage has already was requested on this server")
-    
-    def polling(self):
-        self.connection._notify()
 
 
 class MSFConnectionFactory(RConnectionFactory):
@@ -1915,10 +1909,12 @@ class ServerBuilder(object):
             logger.error("should indicated one ip address for DNS(ip value in --dnsaddr or in --ipaddr parameter")
             return False
         
-        start_dns_task = DefferedTask(DnsServer.create, args.domain, dns_addr if dns_addr else args.ipaddr)
+        connector = SDnsConnector()
+        registrator = Registrator(connector)
+        start_dns_task = DefferedTask(DnsServer.create, args.domain, 
+                                      dns_addr if dns_addr else args.ipaddr, registrator)
         self._append_to_seq(start_dns_task)
 
-        connector = SDnsConnector()
         msf_addr, msf_port = self._parse_addr_port(args.laddr)
         listener_factory = RListenerFactory(connection_factory=MSFConnectionFactory(connector))
         listener_task = DefferedTask(reactor.create_listener, msf_addr if msf_addr else '0.0.0.0', msf_port, listener_factory=listener_factory)
@@ -1939,7 +1935,6 @@ class ServerBuilder(object):
             server_task_stop = DefferedTask(s.shutdown)
             self._append_to_seq(server_task, server_task_stop)
         
-        registrator = Registrator.instance()
         registrator_stop = DefferedTask(registrator.shutdown)
         self._append_to_seq(None, registrator_stop)
 
