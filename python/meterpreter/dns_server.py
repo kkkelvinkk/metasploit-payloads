@@ -854,7 +854,7 @@ class BlockSizedData(object):
 
         end_index = min(start_index + self.block_size, self.data_size)
         is_last = self.data_size == end_index
-        return is_last, self.data[start_index:end_index]
+        return is_last, bytearray(self.data[start_index:end_index])
 
     def get_size(self):
         return self.data_size
@@ -1219,19 +1219,28 @@ class SDnsConnector(WithLogger):
             raise RuntimeError("Server id or connection is not defined") 
         # find waited clients on dnsClientMap
         connector = self._find_other_connector(self.dnsClientMap, server_id)
+        stager = False
+        proxy_st = None
         if not connector:
             # check stagers
+            self._logger.info("DNS clients is not found.Look at stagers")
             with self.lock, ignored(KeyError):
+                self._logger.info("stagers %s", self.dnsStagerMap)
                 proxy_st = self.dnsStagerMap.pop(server_id)
                 connector =  proxy_st._connector._create_paired()
+                self._logger.info("Connector created")
+                stager = True
     
-        proxy = ProxySocket(client, connector)
+        proxy = ProxySocket(client, connector, stager)
+        if proxy_st:
+            proxy_st.detach_func = partial(self._detach_stager, server_id, weakref.ref(proxy))
         self._update_map(self.socketClientMap, server_id, proxy)
         return proxy
 
     def register_dns(self, server_id):
         if len(server_id) == 0:
             raise RuntimeError("Can't register dns client with empty server_id")
+        self._logger.info("Dns %s", self.socketClientMap)
         proxy = ProxyDNS(self._find_other_connector(self.socketClientMap, server_id))
         self._update_map(self.dnsClientMap, server_id, proxy)
         return proxy
@@ -1240,7 +1249,7 @@ class SDnsConnector(WithLogger):
         if proxy_ref:
             r = proxy_ref()
             if r:
-                r._paired.clear()
+                r._connector._paired.clear()
                 self._append_socket(server_id, r)
 
     def register_stager(self, server_id):
@@ -1259,10 +1268,12 @@ class SDnsConnector(WithLogger):
                 proxy_ref = None
                 if s_proxy:
                     connector = s_proxy._connector._create_paired("stager")
-                    proxy_ref = weakref.ref(proxy_ref)
+                    s_proxy._stager = True
+                    proxy_ref = weakref.ref(s_proxy)
                 _detach_func = partial(self._detach_stager, server_id, proxy_ref) if s_proxy else None
                 proxy = ProxyStager(connector, detach_func=_detach_func)
                 if not proxy.is_paired():
+                    self._logger.info("Append stager for waiting clients(%s)", server_id)
                     self.dnsStagerMap[server_id] = proxy
         return proxy
 
@@ -1344,6 +1355,7 @@ class BaseProxy(object):
 
     def __init__(self, connector=None):
         self._connector = connector or ProxyConnector()
+        self.other_name = ""
 
     def is_paired(self):
         return self._connector._paired.isSet()
@@ -1360,13 +1372,17 @@ class BaseProxy(object):
     def set_on_event(self, func):
         self._connector.set_on_event(func)
 
+    def other_name(self):
+        return self.other_name
+
 
 class ProxySocket(BaseProxy):
     
-    def __init__(self, client, connector=None):
+    def __init__(self, client, connector=None, stager=False):
         super(ProxySocket, self).__init__(connector)
         self._client = client
         self._connector._attach_queue_callback(self._notify)
+        self._stager = stager
 
     def _notify(self):
         self._client._notify_new_data()
@@ -1834,7 +1850,10 @@ class LSClient(WithLogger):
         self.proxy.set_on_event(self._on_proxy_event)
         if self.proxy.is_paired():
             self._logger.info("New client is found.")
-            self._read_status()
+            if self.proxy._stager:
+                self._read_stage_header()
+            else:
+                self._read_status()
         else:
             self._logger.info("There are no clients for server id %s. Waiting", self.msf_id)
 
