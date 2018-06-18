@@ -1190,11 +1190,18 @@ class StageClient(object):
         self.data_len = len(data) if data else 0
         self.encoder_data = {}
         self.ts = 0
+        self.proxy = None
 
     def update_last_request_ts(self):
         self.ts = int(time.time())
 
     def request_data_header(self, encoder):
+        if not self.stage_data:
+            if self.proxy:
+                self.stage_data = self.proxy.receive()
+            if self.stage_data:
+                self.proxy = None
+                self.data_len = len(self.stage_data)
         return encoder.encode_data_header(self.subdomain, self.data_len)
 
     def request_data(self, index, encoder):
@@ -1274,43 +1281,51 @@ class LQueue(object):
 
 
 class ProxyConnector(WithLogger):
-    _disconnectObject = list()
+    EVENT_CONNECTED, EVENT_DISCONNECTED, EVENT_DATA = range(3)
 
     def __init__(self, send_queue=None, recv_queue=None):
         self._send_queue = send_queue or LQueue()
         self._recv_queue = recv_queue or LQueue()
         self._paired = threading.Event()
-        self.on_connected = None
-        self.on_disconnected = None
+        self._event_func = None 
 
-    def set_on_connect(self, func):
-        self.on_connected = func
+    def set_on_event(self, func):
+        self._event_func = func
 
-    def set_on_disconnect(self, func):
-        self.on_disconnected = func
+    def _on_event(self, event, arg=None):
+        if self._event_func:
+            self._event_func(event, arg)
+
+    def _send(self, evt, data=None):
+        self._send_queue.append((evt, data))
 
     def send(self, packet):
-        self._send_queue.append(packet)
+        self._send(ProxyConnector.EVENT_DATA, packet)
 
     def receive(self):
-        data = self._recv_queue.pop()
-        if id(data) == id(self._disconnectObject):
-            self._paired.clear()
-            if self.on_disconnected:
-                self.on_disconnected()
-            data = None
+        data = None
+        while True:
+            item = self._recv_queue.pop()
+            if not item:
+                break
+            evt, data = item
+            if evt == ProxyConnector.EVENT_DATA:
+                break
+            else:
+                if evt == ProxyConnector.EVENT_DISCONNECTED:
+                    self._paired.clear()
+                self._on_event(evt, data)
         return data
 
     def disconnect(self):
-        self.send(self._disconnectObject)
+        self._send(ProxyConnector.EVENT_DISCONNECTED)
         self._paired.clear()
 
     def _create_paired(self):
         paired = ProxyConnector(self._recv_queue, self._send_queue)
         paired._paired.set()
         self._paired.set()
-        if self.on_connected:
-            self.on_connected()
+        self._on_event(self.EVENT_CONNECTED)
         return paired
 
     def _attach_queue_callback(self, callback):
@@ -1325,12 +1340,6 @@ class BaseProxy(object):
     def is_paired(self):
         return self._connector._paired.isSet()
     
-    def notify_on_connect(self, func):
-        self._connector.set_on_connect(func)
-
-    def notify_on_disconnect(self, func):
-        self._connector.set_on_disconnect(func)
-
     def send(self, data):
         self._connector.send(data)
 
@@ -1339,6 +1348,13 @@ class BaseProxy(object):
 
     def disconnect(self):
         self._connector.disconnect()
+
+    def set_on_event(self, func):
+        self._connector.set_on_event(func)
+
+    def move_to(self, proxy):
+        proxy._connector = self._connector
+        self._connector = None
 
 
 class ProxySocket(BaseProxy):
@@ -1356,16 +1372,28 @@ class ProxyDNS(BaseProxy):
     pass
 
 
+class ProxyStager(BaseProxy):
+
+    def __init__(self, connector=None):
+        super(ProxyStager, self).__init__(connector)
+        self.data = None
+
+    def send(self, data):
+        pass
+
+    def receive(self):
+        if not self.data:
+            self.data = super(ProxyStager, self).receive()
+        return self.data
+
+
 class StagerKeeper(WithLogger):
 
     def __init__(self):
         self.stagerMap = {}
 
-    def set_stager(self, server_id, data):
-        self.stagerMap[server_id] = StageClient(data) 
-
     def get_stager(self, server_id):
-        return self.stagerMap.get(server_id, StageClient())
+        return self.stagerMap.setdefault(server_id, StageClient())
 
 
 class Request(WithLogger):
@@ -1744,16 +1772,25 @@ class LSClient(WithLogger):
 
     def _new_proxy_data(self):
         if self.proxy:
-            data = self.proxy.receive()
-            if data:
-                send_task = SendTask(data)
-                send_task.run(self.connection)
+            while True:
+                data = self.proxy.receive()
+                if data:
+                    send_task = SendTask(data)
+                    send_task.run(self.connection)
+                else:
+                    break
 
     def _notify_new_data(self):
         task = DefferedTask(self._new_proxy_data)
         self.connection.add_deffered_task(task)
 
-    def _on_new_client(self):
+    def _on_proxy_event(self, evt, data):
+        if evt == ProxyConnector.EVENT_CONNECTED:
+            self._on_new_client(data)
+        elif evt == ProxyConnector.EVENT_DISCONNECTED:
+            self._on_closed_client()
+
+    def _on_new_client(self, data):
         self._logger.info("Association with DNS client is done")
         self._read_status()
 
@@ -1776,8 +1813,7 @@ class LSClient(WithLogger):
         self.msf_id = task.data.decode()
         self._logger.info("Got id = %s", self.msf_id)
         self.proxy = self.connector.register_socket(self.msf_id, self)
-        self.proxy.notify_on_connect(self._on_new_client)
-        self.proxy.notify_on_disconnect(self._on_closed_client)
+        self.proxy.set_on_event(self._on_proxy_event)
         if self.proxy.is_paired():
             self._logger.info("New client is found.")
             self._read_status()
