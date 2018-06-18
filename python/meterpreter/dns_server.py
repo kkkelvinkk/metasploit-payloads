@@ -25,6 +25,7 @@ import errno
 from collections import deque
 from functools import partial, wraps
 import types
+import weakref
 
 try:
     from dnslib import *
@@ -865,13 +866,10 @@ class Registrator(WithLogger):
     def __init__(self, connector):
         self.id_list = [chr(i) for i in range(ord('a'), ord('z')+1)]
         self.connector = connector
+        self.stage_keeper = StagerKeeper(connector)
         self.clientMap = {}
-        self.servers = {}
-        self.stagers = {}
-        self.waited_servers = {}
         self.unregister_list = []
         self.lock = threading.Lock()
-        self.default_stager = StageClient()
         self.timeout_service = TimeoutService(timeout=20)
         self.timeout_service.add_callback(self.on_timeout)
 
@@ -901,25 +899,7 @@ class Registrator(WithLogger):
 
     def get_stage_client_for_server(self, server_id):
         with self.lock:
-            try:
-                return self.stagers[server_id]
-            except KeyError:
-                self._logger.info("Trying to request stager for server with %s id", server_id)
-                waited_lst = self.waited_servers.get(server_id, [])
-                if waited_lst:
-                    server = waited_lst[0]
-                    server.request_stage()
-                else:
-                    self._logger.info("Server list is empty")
-                return self.default_stager
-
-    def add_stager_for_server(self, server_id, data):
-        with self.lock:
-            self.stagers[server_id] = StageClient(data)
-
-    def is_stager_server(self, server_id):
-        with self.lock:
-            return server_id in self.stagers
+            return self.stage_keeper.get_stager(server_id)
 
     def _unregister_client(self, client_id):
         with self.lock:
@@ -949,15 +929,6 @@ class Registrator(WithLogger):
                 self.id_list.append(client_id)
                 self._logger.info("Unregister client with '%s' id(reason: timeout)", client_id)
 
-            ids_for_remove = [server_id for server_id, client in self.stagers.iteritems()
-                              if abs(client.ts - cur_time) >= self.CLIENT_TIMEOUT * 4]
-
-            for server_id in ids_for_remove:
-                waiters = self.waited_servers.get(server_id, [])
-                if not waiters:
-                    del self.stagers[server_id]
-                    self._logger.info("Clearing stager client for server with '%s' id(reason: timeout)", server_id)
-
             unregister_list = []
             for client_id in self.unregister_list:
                 client = self.clientMap.get(client_id, None)
@@ -972,10 +943,6 @@ class Registrator(WithLogger):
             self.unregister_list = unregister_list
                     
         for client in disconnect_client_lst:
-            if client.server_id:
-                clients = self.servers.get(client.server_id, [])
-                with ignored(ValueError):
-                    clients.remove(client)
             client.on_timeout()
 
 
@@ -1185,12 +1152,12 @@ class Client(WithLogger):
 class StageClient(object):
     subdomain = '7812'
 
-    def __init__(self, data=None):
+    def __init__(self, data=None, proxy=None):
         self.stage_data = data
         self.data_len = len(data) if data else 0
         self.encoder_data = {}
         self.ts = 0
-        self.proxy = None
+        self.proxy = proxy
 
     def update_last_request_ts(self):
         self.ts = int(time.time())
@@ -1200,6 +1167,7 @@ class StageClient(object):
             if self.proxy:
                 self.stage_data = self.proxy.receive()
             if self.stage_data:
+                self.proxy.detach()
                 self.proxy = None
                 self.data_len = len(self.stage_data)
         return encoder.encode_data_header(self.subdomain, self.data_len)
@@ -1226,6 +1194,7 @@ class SDnsConnector(WithLogger):
     def __init__(self):
         self.socketClientMap = {}
         self.dnsClientMap = {}
+        self.dnsStagerMap = {}
         self.lock = threading.RLock()
 
     def _find_other_connector(self, clientMap, server_id):
@@ -1244,6 +1213,9 @@ class SDnsConnector(WithLogger):
             if not proxy.is_paired():
                 clientMap.setdefault(server_id, deque()).append(proxy)
 
+    def _append_socket(self, server_id, proxy):
+        self._update_map(self.socketClientMap, server_id, proxy)
+
     def register_socket(self, server_id, client):
         if len(server_id) == 0 or not client:
             raise RuntimeError("Server id or connection is not defined") 
@@ -1256,6 +1228,26 @@ class SDnsConnector(WithLogger):
             raise RuntimeError("Can't register dns client with empty server_id")
         proxy = ProxyDNS(self._find_other_connector(self.socketClientMap, server_id))
         self._update_map(self.dnsClientMap, server_id, proxy)
+        return proxy
+
+    def register_stager(self, server_id):
+        if len(server_id) == 0:
+            raise RuntimeError("Can't register dns client with empty server_id")
+        s_proxy = None
+        with self.lock:
+            proxy = self.dnsStagerMap.get(server_id, None)
+            if proxy:
+                return proxy
+            else:
+                connector = None
+                socket_proxies = self.socketClientMap.get(server_id, deque())
+                with ignored(IndexError):
+                    s_proxy = socket_proxies.popleft()
+                if s_proxy:
+                    connector = s_proxy._connector._create_paired("stager")
+                proxy = ProxyStager(self, connector, server_id, s_proxy)
+                if not proxy.is_paired():
+                    self.dnsStagerMap[server_id] = proxy
         return proxy
 
 
@@ -1321,11 +1313,11 @@ class ProxyConnector(WithLogger):
         self._send(ProxyConnector.EVENT_DISCONNECTED)
         self._paired.clear()
 
-    def _create_paired(self):
+    def _create_paired(self, arg=None):
         paired = ProxyConnector(self._recv_queue, self._send_queue)
         paired._paired.set()
         self._paired.set()
-        self._on_event(self.EVENT_CONNECTED)
+        self._on_event(self.EVENT_CONNECTED, arg)
         return paired
 
     def _attach_queue_callback(self, callback):
@@ -1352,10 +1344,6 @@ class BaseProxy(object):
     def set_on_event(self, func):
         self._connector.set_on_event(func)
 
-    def move_to(self, proxy):
-        proxy._connector = self._connector
-        self._connector = None
-
 
 class ProxySocket(BaseProxy):
     
@@ -1374,9 +1362,12 @@ class ProxyDNS(BaseProxy):
 
 class ProxyStager(BaseProxy):
 
-    def __init__(self, connector=None):
+    def __init__(self, sdnsconnector=None, connector=None, server_id="", socket=None):
         super(ProxyStager, self).__init__(connector)
         self.data = None
+        self.server_id = server_id
+        self.sdnsconnector = sdnsconnector
+        self.ref = weakref.ref(socket) if socket else None
 
     def send(self, data):
         pass
@@ -1386,14 +1377,29 @@ class ProxyStager(BaseProxy):
             self.data = super(ProxyStager, self).receive()
         return self.data
 
+    def detach(self):
+        if self._connector and self.ref:
+            r = self.ref()
+            if r:
+                r._connector._paired.clear()
+                self.sdnsconnector._append_socket(self.server_id, r)
+                self.ref = None
+
 
 class StagerKeeper(WithLogger):
 
-    def __init__(self):
+    def __init__(self, connector):
         self.stagerMap = {}
+        self.connector = connector
 
     def get_stager(self, server_id):
-        return self.stagerMap.setdefault(server_id, StageClient())
+        self._logger.info("Looking for stager for id=%s", server_id)
+        client = self.stagerMap.get(server_id, None)
+        if not client:
+            self._logger.info("This is the first stage request.Creating stage client")
+            client = StageClient(proxy=self.connector.register_stager(server_id))
+            self.stagerMap[server_id] = client
+        return client 
 
 
 class Request(WithLogger):
@@ -1792,7 +1798,10 @@ class LSClient(WithLogger):
 
     def _on_new_client(self, data):
         self._logger.info("Association with DNS client is done")
-        self._read_status()
+        if data and data == "stager":
+            self._read_stage_header()
+        else:
+            self._read_status()
 
     def _on_closed_client(self):
         self._logger.info("DNS client is disconnected")
@@ -1853,8 +1862,7 @@ class LSClient(WithLogger):
         task = self._create_receive_task(stage_size)
         yield task, self.connection
         self._logger.info("Stage read is done")
-        # self.registrator.add_stager_for_server(self.msf_id, data+task.data)
-        self._read_status()
+        self.proxy.send(data + task.data)
 
     @connection_task
     def _read_tlv_header(self):
