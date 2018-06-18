@@ -843,7 +843,7 @@ class PartedData(object):
 
 class BlockSizedData(object):
     def __init__(self, data, block_size):
-        self.data = data
+        self.data = memoryview(data)
         self.block_size = block_size
         self.data_size = len(self.data)
 
@@ -1200,12 +1200,10 @@ class SDnsConnector(WithLogger):
     def _find_other_connector(self, clientMap, server_id):
         connector = None
         client_proxy = None
-        with self.lock:
+        with self.lock, ignored(IndexError):
             clients = clientMap.get(server_id, deque())
-            with ignored(IndexError):
-                client_proxy = clients.popleft()        
-            if client_proxy:
-                connector = client_proxy._connector._create_paired()
+            client_proxy = clients.popleft()        
+            connector = client_proxy._connector._create_paired()
         return connector
 
     def _update_map(self, clientMap, server_id, proxy):
@@ -1219,7 +1217,15 @@ class SDnsConnector(WithLogger):
     def register_socket(self, server_id, client):
         if len(server_id) == 0 or not client:
             raise RuntimeError("Server id or connection is not defined") 
-        proxy = ProxySocket(client, self._find_other_connector(self.dnsClientMap, server_id))
+        # find waited clients on dnsClientMap
+        connector = self._find_other_connector(self.dnsClientMap, server_id)
+        if not connector:
+            # check stagers
+            with self.lock, ignored(KeyError):
+                proxy_st = self.dnsStagerMap.pop(server_id)
+                connector =  proxy_st._connector._create_paired()
+    
+        proxy = ProxySocket(client, connector)
         self._update_map(self.socketClientMap, server_id, proxy)
         return proxy
 
@@ -1229,6 +1235,13 @@ class SDnsConnector(WithLogger):
         proxy = ProxyDNS(self._find_other_connector(self.socketClientMap, server_id))
         self._update_map(self.dnsClientMap, server_id, proxy)
         return proxy
+
+    def _detach_stager(self, server_id, proxy_ref):
+        if proxy_ref:
+            r = proxy_ref()
+            if r:
+                r._paired.clear()
+                self._append_socket(server_id, r)
 
     def register_stager(self, server_id):
         if len(server_id) == 0:
@@ -1243,9 +1256,12 @@ class SDnsConnector(WithLogger):
                 socket_proxies = self.socketClientMap.get(server_id, deque())
                 with ignored(IndexError):
                     s_proxy = socket_proxies.popleft()
+                proxy_ref = None
                 if s_proxy:
                     connector = s_proxy._connector._create_paired("stager")
-                proxy = ProxyStager(self, connector, server_id, s_proxy)
+                    proxy_ref = weakref.ref(proxy_ref)
+                _detach_func = partial(self._detach_stager, server_id, proxy_ref) if s_proxy else None
+                proxy = ProxyStager(connector, detach_func=_detach_func)
                 if not proxy.is_paired():
                     self.dnsStagerMap[server_id] = proxy
         return proxy
@@ -1362,12 +1378,10 @@ class ProxyDNS(BaseProxy):
 
 class ProxyStager(BaseProxy):
 
-    def __init__(self, sdnsconnector=None, connector=None, server_id="", socket=None):
+    def __init__(self, connector=None, detach_func=None):
         super(ProxyStager, self).__init__(connector)
         self.data = None
-        self.server_id = server_id
-        self.sdnsconnector = sdnsconnector
-        self.ref = weakref.ref(socket) if socket else None
+        self.detach_func = detach_func
 
     def send(self, data):
         pass
@@ -1378,13 +1392,8 @@ class ProxyStager(BaseProxy):
         return self.data
 
     def detach(self):
-        if self._connector and self.ref:
-            r = self.ref()
-            if r:
-                r._connector._paired.clear()
-                self.sdnsconnector._append_socket(self.server_id, r)
-                self.ref = None
-
+        if self._connector and self.detach_func:
+            self.detach_func()
 
 class StagerKeeper(WithLogger):
 
