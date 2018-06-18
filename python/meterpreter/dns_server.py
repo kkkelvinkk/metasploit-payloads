@@ -1197,14 +1197,12 @@ class SDnsConnector(WithLogger):
         self.dnsStagerMap = {}
         self.lock = threading.RLock()
 
-    def _find_other_connector(self, clientMap, server_id):
-        connector = None
+    def _find_other_proxy(self, clientMap, server_id):
         client_proxy = None
         with self.lock, ignored(IndexError):
             clients = clientMap.get(server_id, deque())
             client_proxy = clients.popleft()        
-            connector = client_proxy._connector._create_paired()
-        return connector
+        return client_proxy
 
     def _update_map(self, clientMap, server_id, proxy):
         with self.lock:
@@ -1218,20 +1216,20 @@ class SDnsConnector(WithLogger):
         if len(server_id) == 0 or not client:
             raise RuntimeError("Server id or connection is not defined") 
         # find waited clients on dnsClientMap
-        connector = self._find_other_connector(self.dnsClientMap, server_id)
+        other_proxy = self._find_other_proxy(self.dnsClientMap, server_id)
         stager = False
         proxy_st = None
-        if not connector:
+        if not other_proxy:
             # check stagers
             self._logger.info("DNS clients is not found.Look at stagers")
             with self.lock, ignored(KeyError):
                 self._logger.info("stagers %s", self.dnsStagerMap)
-                proxy_st = self.dnsStagerMap.pop(server_id)
-                connector =  proxy_st._connector._create_paired()
+                other_proxy = self.dnsStagerMap.pop(server_id)
+                proxy_st = other_proxy
                 self._logger.info("Connector created")
                 stager = True
     
-        proxy = ProxySocket(client, connector, stager)
+        proxy = ProxySocket(client, other_proxy, stager)
         if proxy_st:
             proxy_st.detach_func = partial(self._detach_stager, server_id, weakref.ref(proxy))
         self._update_map(self.socketClientMap, server_id, proxy)
@@ -1241,7 +1239,7 @@ class SDnsConnector(WithLogger):
         if len(server_id) == 0:
             raise RuntimeError("Can't register dns client with empty server_id")
         self._logger.info("Dns %s", self.socketClientMap)
-        proxy = ProxyDNS(self._find_other_connector(self.socketClientMap, server_id))
+        proxy = ProxyDNS(self._find_other_proxy(self.socketClientMap, server_id))
         self._update_map(self.dnsClientMap, server_id, proxy)
         return proxy
 
@@ -1267,11 +1265,10 @@ class SDnsConnector(WithLogger):
                     s_proxy = socket_proxies.popleft()
                 proxy_ref = None
                 if s_proxy:
-                    connector = s_proxy._connector._create_paired("stager")
                     s_proxy._stager = True
                     proxy_ref = weakref.ref(s_proxy)
                 _detach_func = partial(self._detach_stager, server_id, proxy_ref) if s_proxy else None
-                proxy = ProxyStager(connector, detach_func=_detach_func)
+                proxy = ProxyStager(s_proxy, detach_func=_detach_func)
                 if not proxy.is_paired():
                     self._logger.info("Append stager for waiting clients(%s)", server_id)
                     self.dnsStagerMap[server_id] = proxy
@@ -1353,8 +1350,8 @@ class ProxyConnector(WithLogger):
 
 class BaseProxy(object):
 
-    def __init__(self, connector=None):
-        self._connector = connector or ProxyConnector()
+    def __init__(self, proxy=None, proxy_arg=None):
+        self._connector = proxy._connector._create_paired(proxy_arg) if proxy else ProxyConnector()
         self.other_name = ""
 
     def is_paired(self):
@@ -1372,14 +1369,11 @@ class BaseProxy(object):
     def set_on_event(self, func):
         self._connector.set_on_event(func)
 
-    def other_name(self):
-        return self.other_name
-
 
 class ProxySocket(BaseProxy):
     
-    def __init__(self, client, connector=None, stager=False):
-        super(ProxySocket, self).__init__(connector)
+    def __init__(self, client, proxy=None, stager=False):
+        super(ProxySocket, self).__init__(proxy)
         self._client = client
         self._connector._attach_queue_callback(self._notify)
         self._stager = stager
@@ -1394,8 +1388,8 @@ class ProxyDNS(BaseProxy):
 
 class ProxyStager(BaseProxy):
 
-    def __init__(self, connector=None, detach_func=None):
-        super(ProxyStager, self).__init__(connector)
+    def __init__(self, proxy=None, detach_func=None):
+        super(ProxyStager, self).__init__(proxy, "stager")
         self.data = None
         self.detach_func = detach_func
 
