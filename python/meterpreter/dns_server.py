@@ -8,12 +8,12 @@
 
 import argparse
 import sys
+import os
 import time
 import threading
 import SocketServer
 import struct
 import re
-import Queue
 import base64
 import logging
 from logging.handlers import RotatingFileHandler
@@ -28,7 +28,11 @@ import types
 import weakref
 
 try:
-    from dnslib import *
+    from dnslib import (
+        DNSHeader, DNSKEY,
+        QTYPE, DNSRecord, RR, NS,
+        A, AAAA
+    )
 except ImportError:
     print("Missing dependency dnslib: <https://pypi.python.org/pypi/dnslib>. Please install it with `pip`.")
     sys.exit(2)
@@ -1020,7 +1024,7 @@ class Client(WithLogger):
         with self.lock:
             # msf sends 2 packets after exit packet, but client doesn't request it
             # self.client_queue.empty() and \ 
-            return not self.server and not self.received_data.is_complete() 
+            return not self.proxy and not self.received_data.is_complete() 
 
     def register_client(self, server_id, encoder):
         client_id = self.registrator.request_client_id(self)
@@ -1253,13 +1257,12 @@ class SDnsConnector(WithLogger):
     def register_stager(self, server_id):
         if len(server_id) == 0:
             raise RuntimeError("Can't register dns client with empty server_id")
-        s_proxy = None
         with self.lock:
             proxy = self.dnsStagerMap.get(server_id, None)
             if proxy:
                 return proxy
             else:
-                connector = None
+                s_proxy = None
                 socket_proxies = self.socketClientMap.get(server_id, deque())
                 with ignored(IndexError):
                     s_proxy = socket_proxies.popleft()
