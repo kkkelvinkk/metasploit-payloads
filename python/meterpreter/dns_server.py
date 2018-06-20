@@ -867,14 +867,14 @@ class BlockSizedData(object):
 class Registrator(WithLogger):
     CLIENT_TIMEOUT = 40
 
-    def __init__(self, connector):
+    def __init__(self, connector, timeout_service):
         self.id_list = [chr(i) for i in range(ord('a'), ord('z')+1)]
         self.connector = connector
         self.stage_keeper = StagerKeeper(connector)
         self.clientMap = {}
         self.unregister_list = []
         self.lock = threading.Lock()
-        self.timeout_service = TimeoutService(timeout=20)
+        self.timeout_service = timeout_service
         self.timeout_service.add_callback(self.on_timeout)
 
     def shutdown(self):
@@ -968,6 +968,13 @@ class TimeoutService(object):
 
     def _empty_listeners(self):
         return len(self.listeners) == 0 and len(self.one_shot_listeners) == 0
+
+    def shutdown(self):
+        with self.lock:
+            if self.timer:
+                self.timer.cancel()
+            self.listeners = None
+            self.one_shot_listeners = None
 
     def timer_expired(self):
         with self.lock:
@@ -1984,7 +1991,10 @@ class ServerBuilder(object):
             return False
         
         connector = SDnsConnector()
-        registrator = Registrator(connector)
+        timeout_service = TimeoutService(timeout=20)
+        timeout_service_stop = DefferedTask(timeout_service.shutdown)
+        self._append_to_seq(None, timeout_service_stop)
+        registrator = Registrator(connector, timeout_service)
         start_dns_task = DefferedTask(DnsServer.create, args.domain, 
                                       dns_addr if dns_addr else args.ipaddr, registrator)
         self._append_to_seq(start_dns_task)
