@@ -689,6 +689,9 @@ class IPv6Encoder(Encoder):
     MAX_DATA_IN_RR = 14
     MAX_PACKET_SIZE = MAX_IPV6RR_NUM * MAX_DATA_IN_RR
     IPV6_FORMAT = ":".join(["{:04x}"]*8)
+    _info_ready = 0x00
+    _info_finish = 0xff
+    _info_more_data = 0xf0
 
     @staticmethod
     def _encode_nextdomain_datasize(next_domain, data_size):
@@ -746,16 +749,20 @@ class IPv6Encoder(Encoder):
         return block
 
     @staticmethod
+    def _encode_send_service_info(info):
+        return ["ffff:0000:0000:0000:0000:%02x00:0000:0000" % info]
+
+    @staticmethod
     def encode_ready_receive():
-        return ["ffff:0000:0000:0000:0000:0000:0000:0000"]
+        return IPv6Encoder._encode_send_service_info(IPv6Encoder._info_ready)
 
     @staticmethod
     def encode_finish_send():
-        return ["ffff:0000:0000:0000:0000:ff00:0000:0000"]
+        return IPv6Encoder._encode_send_service_info(IPv6Encoder._info_finish)
 
     @staticmethod
     def encode_send_more_data():
-        return ["ffff:0000:0000:0000:0000:f000:0000:0000"]
+        return IPv6Encoder._encode_send_service_info(IPv6Encoder._info_more_data)
 
     @staticmethod
     def encode_registration(client_id, status):
@@ -1026,6 +1033,9 @@ class Client(WithLogger):
 
     def update_last_request_ts(self):
         self.ts = int(time.time())
+
+    def _encode_reset(self, encoder):
+        return encoder.encode_reset()
 
     def is_idle(self):
         with self.lock:
@@ -1414,6 +1424,7 @@ class ProxyStager(BaseProxy):
     def detach(self):
         if self._connector and self.detach_func:
             self.detach_func()
+
 
 class StagerKeeper(WithLogger):
 
