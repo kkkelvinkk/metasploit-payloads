@@ -10,12 +10,39 @@
 #include "../../common/pivot_packet_dispatch.h"
 
 typedef enum {
-    eSTATUS_SUCCESS,
+    eSTATUS_SUCCESS = 0,
     eSTATUS_BAD_DATA,
     eSTATUS_TRIES_EXCEED,
     eSTATUS_DNS_ERROR,
-    eSTATUS_DNS_NO_RECORDS
+    eSTATUS_DNS_NO_RECORDS,
+    eSTATUS_DNS_SERVICE_START = 20,
+    eSTATUS_DNS_SERVICE_RESET,
+    eSTATUS_DNS_SERVICE_SHUTDOWN,
+    eSTATUS_DNS_SERVICE_MAX,
 } eDnsStatus;
+
+typedef struct _IncapsulatedDns
+{
+	size_t size;
+	eDnsStatus status;
+	PUCHAR packet;
+} IncapsulatedDns;
+
+typedef __declspec(align(32)) struct _DNSThreadParams
+{
+	volatile LONG* stop; 
+    eDnsStatus stop_status;
+	size_t index;
+    size_t index_stop;
+	WORD request_type;
+	wchar_t *subd;
+	wchar_t *domain;
+    wchar_t *client_id;
+	PIP4_ARRAY pSrvList;
+	UINT size;
+    UINT status;
+	UCHAR *result;
+} DNSThreadParams;
 
 typedef struct _DnsRecordsHanlder
 {
@@ -311,11 +338,47 @@ static void prepare_send_data_request(DnsRequestContext *request_context, size_t
     ptr += index_len;
     *ptr = L'.';
     ++ptr;
-    
 
     request_context->num_written = ptr - request_context->request;
     //save number of bytes used from data
     *data_size = ptr_data - data;
+}
+
+static eDnsStatus check_for_service_ipv6(DnsIPv6Tunnel* dns_tunnel)
+{
+    eDnsStatus dns_status = eSTATUS_SUCCESS;
+    if (dns_tunnel->ff == 0xfe && dns_tunnel->index_size == 0xa2)
+    {
+        switch (dns_tunnel->block.data[8])
+        {
+            case 0xf1:
+                dns_status = eSTATUS_DNS_SERVICE_RESET;
+                break;
+            case 0xf2:
+                dns_status = eSTATUS_DNS_SERVICE_SHUTDOWN;
+                break;
+            default:
+                break;
+        }
+    }
+    return dns_status;
+}
+
+static eDnsStatus check_for_service_dnskey(DnsKeyTunnel* dns_tunnel)
+{
+    eDnsStatus dns_status = eSTATUS_SUCCESS;
+    switch (dns_tunnel->status)
+    {
+    case 0xf1:
+        dns_status = eSTATUS_DNS_SERVICE_RESET;
+        break;
+    case 0xf2:
+        dns_status = eSTATUS_DNS_SERVICE_SHUTDOWN;
+        break;
+    default:
+        break;
+    }
+    return dns_status;
 }
 
 static eDnsStatus ipv6_process_register(PDNS_RECORD records, DnsTransportContext *ctx)
@@ -331,6 +394,13 @@ static eDnsStatus ipv6_process_register(PDNS_RECORD records, DnsTransportContext
             if (result_iter->wType == DNS_TYPE_AAAA)
             {
                 DnsIPv6Tunnel *tmp = ((DnsIPv6Tunnel *)result_iter->Data.AAAA.Ip6Address.IP6Byte);
+
+                eDnsStatus service_status = check_for_service_ipv6(tmp);
+                if (service_status != eSTATUS_SUCCESS)
+                {
+                    result = service_status;
+                    return result;
+                }
 
                 if ((UCHAR)(tmp->index_size) == 0xff && tmp->ff == 0xff)
                 {
@@ -393,8 +463,12 @@ static eDnsStatus dnskey_process_register(PDNS_RECORD records, DnsTransportConte
                     }
                     else
                     {
-                        vdprintf("[PACKET RECEIVE DNS] BAD STATUS");
-                        dns_status = eSTATUS_BAD_DATA;
+                        dns_status = check_for_service_dnskey(tunnel_data);
+                        if (dns_status == eSTATUS_SUCCESS)
+                        {
+                            vdprintf("[PACKET RECEIVE DNS] BAD STATUS");
+                            dns_status = eSTATUS_BAD_DATA;
+                        }
                     }
                 }
                 else
@@ -422,6 +496,13 @@ static eDnsStatus ipv6_process_data_header(PDNS_RECORD records, size_t *data_siz
             if (result_iter->wType == DNS_TYPE_AAAA)
             {
                 DnsIPv6Tunnel *tmp = ((DnsIPv6Tunnel *)result_iter->Data.AAAA.Ip6Address.IP6Byte);
+
+                eDnsStatus service_status = check_for_service_ipv6(tmp);
+                if (service_status != eSTATUS_SUCCESS)
+                {
+                    result = service_status;
+                    return result;
+                }
 
                 if ((UCHAR)(tmp->index_size) == 0x81 && tmp->ff == 0xfe)
                 {
@@ -480,8 +561,12 @@ static eDnsStatus dnskey_process_data_header(PDNS_RECORD records, size_t *data_s
                     }
                     else
                     {
-                        vdprintf("[PACKET RECEIVE DNS] BAD STATUS");
-                        dns_status = eSTATUS_BAD_DATA;
+                        dns_status = check_for_service_dnskey(tunnel_data);
+                        if (dns_status == eSTATUS_SUCCESS)
+                        {
+                            vdprintf("[PACKET RECEIVE DNS] BAD STATUS");
+                            dns_status = eSTATUS_BAD_DATA;
+                        }
                     }
                 }
                 else
@@ -513,6 +598,14 @@ static eDnsStatus ipv6_process_data(PDNS_RECORD records, DNSThreadParams *lpPara
             {
                 DnsIPv6Tunnel *tmp = ((DnsIPv6Tunnel *)result_iter->Data.AAAA.Ip6Address.IP6Byte);
                 DnsIPv6Tunnel *tunnel_data_tmp = ((DnsIPv6Tunnel *)result_iter->Data.AAAA.Ip6Address.IP6Byte);
+
+                eDnsStatus service_status = check_for_service_ipv6(tmp);
+                if (service_status != eSTATUS_SUCCESS)
+                {
+                    result = service_status;
+                    lpParam->size = 0;
+                    return result;
+                }
 
                 if (tunnel_data_tmp->ff == 0xfe)
                 {
@@ -593,8 +686,13 @@ static eDnsStatus dnskey_process_data(PDNS_RECORD records, DNSThreadParams *lpPa
                     }
                     else
                     {
-                        vdprintf("[PACKET RECEIVE DNS] BAD STATUS");
-                        dns_status = eSTATUS_BAD_DATA;
+                        dns_status = check_for_service_dnskey(tunnel_data);
+                        if (dns_status == eSTATUS_SUCCESS)
+                        {
+                            vdprintf("[PACKET RECEIVE DNS] BAD STATUS");
+                            dns_status = eSTATUS_BAD_DATA;
+                        }
+                        break;
                     }
                 }
                 else
@@ -613,10 +711,18 @@ static eDnsStatus ipv6_process_send_header(PDNS_RECORD records)
 {
     eDnsStatus status = eSTATUS_SUCCESS;
     DnsIPv6Tunnel *tunnel_data = ((DnsIPv6Tunnel *)records->Data.AAAA.Ip6Address.IP6Byte);
-    if (tunnel_data == NULL || tunnel_data->block.header.status_flag != 0)
+    if (tunnel_data == NULL) 
     {
         vdprintf("[PACKET TRANSMIT WINDNS] Header error");
-        status = eSTATUS_BAD_DATA;
+        status = eSTATUS_DNS_NO_RECORDS;
+    }
+    else 
+    {
+        status = check_for_service_ipv6(tunnel_data);
+        if ((status == eSTATUS_SUCCESS) && (tunnel_data->block.header.status_flag != 0))
+        {
+            status = eSTATUS_BAD_DATA;
+        }
     }
     return status;
 }
@@ -639,8 +745,12 @@ static eDnsStatus dnskey_process_send_header(PDNS_RECORD records)
             DnsKeyTunnel *tunnel_data = (DnsKeyTunnel *)(result_iter->Data.Dnskey.Key);
             if (tunnel_data->status != 0)
             {
-                vdprintf("[PACKET RECEIVE DNS] BAD STATUS");
-                dns_status = eSTATUS_BAD_DATA;
+                dns_status = check_for_service_dnskey(tunnel_data);
+                if (dns_status == eSTATUS_SUCCESS)
+                {
+                    vdprintf("[PACKET RECEIVE DNS] BAD STATUS");
+                    dns_status = eSTATUS_BAD_DATA;
+                }
             }
         }
         else
@@ -664,6 +774,13 @@ static eDnsStatus ipv6_process_send(PDNS_RECORD records)
         (records->Data.AAAA.Ip6Address.IP6Byte != NULL))
     {
         DnsIPv6Tunnel *tunnel_data = ((DnsIPv6Tunnel *)records->Data.AAAA.Ip6Address.IP6Byte);
+        eDnsStatus service_status = check_for_service_ipv6(tunnel_data);
+        if (service_status != eSTATUS_SUCCESS)
+        {
+            status = service_status;
+            return status;
+        }
+
         if (tunnel_data->index_size == 0xff && tunnel_data->block.header.status_flag == 0xf0)
         {
         }
@@ -703,8 +820,12 @@ static eDnsStatus dnskey_process_send(PDNS_RECORD records)
             if (tunnel_data->status != 0 &&
                 tunnel_data->status != 0x1)
             {
-                vdprintf("[PACKET RECEIVE DNS] BAD STATUS %d", tunnel_data->status);
-                dns_status = eSTATUS_BAD_DATA;
+                dns_status = check_for_service_dnskey(tunnel_data);
+                if (dns_status == eSTATUS_SUCCESS)
+                {
+                    vdprintf("[PACKET RECEIVE DNS] BAD STATUS");
+                    dns_status = eSTATUS_BAD_DATA;
+                }
             }
         }
         else
@@ -732,6 +853,14 @@ DWORD WINAPI DnsGetDataThreadProc(DNSThreadParams *lpParam)
             if ((handler != NULL) && (handler->on_receive != NULL))
             {
                 lpParam->status = handler->on_receive(context->records, lpParam);
+                if (lpParam->status != eSTATUS_SUCCESS)
+                {
+                    lpParam->size = 0;
+                    // Stop other threads
+                    lpParam->stop_status = lpParam->status;
+                    InterlockedCompareExchange(lpParam->stop, 1, 0);
+                    break;
+                }
             }
             else
             {
@@ -745,6 +874,13 @@ DWORD WINAPI DnsGetDataThreadProc(DNSThreadParams *lpParam)
             lpParam->status = dns_status;
             lpParam->size = 0;
             break;
+        }
+
+        // check if stopped
+        if (InterlockedCompareExchange(lpParam->stop, 1, 1) == 1)
+        {
+            lpParam->size = 0;
+            lpParam->status = lpParam->stop_status;
         }
     }
 
@@ -817,6 +953,11 @@ BOOL get_packet_from_windns(WORD request_type, wchar_t *domain, wchar_t *sub_seq
         }
     }
     free_request_context(&context);
+    if (dns_status > eSTATUS_DNS_SERVICE_START &&
+        dns_status < eSTATUS_DNS_SERVICE_MAX)
+    {
+
+    }
 
     //there is a new data, get it
     if (need_to_receive > 0)
@@ -826,6 +967,7 @@ BOOL get_packet_from_windns(WORD request_type, wchar_t *domain, wchar_t *sub_seq
         vdprintf("[PACKET RECEIVE WINDNS] need to get bytes: %d", need_to_receive);
         HANDLE hThreads[THREADS_MAX];
         DNSThreadParams thread_params[THREADS_MAX];
+        volatile __declspec(align(32)) LONG stop_flag = 0;
 
         size_t num_requests = compute_request_num(request_type, need_to_receive);
         vdprintf("[PACKET RECEIVE WINDNS] need make %d requests", num_requests);
@@ -833,7 +975,6 @@ BOOL get_packet_from_windns(WORD request_type, wchar_t *domain, wchar_t *sub_seq
         size_t iterations = num_requests / (THREADS_MAX);
         size_t iterations_last = (num_requests % THREADS_MAX);
         size_t curr_idx = 0;
-        HANDLE hMutex = CreateMutex(NULL, FALSE, NULL);
 
         size_t created_threads = 0;
         if (num_requests <= THREADS_MAX)
@@ -853,7 +994,7 @@ BOOL get_packet_from_windns(WORD request_type, wchar_t *domain, wchar_t *sub_seq
         for (size_t y = 0; y < created_threads; y++)
         {
             size_t last_idx = curr_idx + (y == (THREADS_MAX - 1) ? iterations_last : iterations);
-            thread_params[y].mutex = &hMutex;
+            thread_params[y].stop = &stop_flag;
             thread_params[y].domain = domain;
             thread_params[y].client_id = client_id;
             thread_params[y].subd = sub_seq_orig;
@@ -862,7 +1003,7 @@ BOOL get_packet_from_windns(WORD request_type, wchar_t *domain, wchar_t *sub_seq
                                                           (y == (THREADS_MAX - 1) ? iterations_last : iterations),
                                                       sizeof(UCHAR));
             thread_params[y].size = 0;
-            thread_params[y].status = 1;
+            thread_params[y].status = eSTATUS_SUCCESS;
             thread_params[y].index = curr_idx;
             thread_params[y].index_stop = last_idx;
             thread_params[y].request_type = request_type;
@@ -907,7 +1048,7 @@ BOOL get_packet_from_windns(WORD request_type, wchar_t *domain, wchar_t *sub_seq
 
     SAFE_FREE(sub_seq_orig);
 
-    vdprintf("[PACKET RECEIVE WINDNS] recieved %d bytes from %d", current_received, need_to_receive);
+    vdprintf("[PACKET RECEIVE WINDNS] received %d bytes from %d", current_received, need_to_receive);
 
     if (need_to_receive == current_received)
     {
@@ -920,7 +1061,7 @@ BOOL get_packet_from_windns(WORD request_type, wchar_t *domain, wchar_t *sub_seq
         }
         else
         {
-            recieve->status = ERROR_SUCCESS;
+            recieve->status = eSTATUS_SUCCESS;
             recieve->size = need_to_receive;
             vdprintf("[PACKET RECEIVE WINDNS] PACKET READY");
         }
@@ -934,12 +1075,12 @@ BOOL get_packet_from_windns(WORD request_type, wchar_t *domain, wchar_t *sub_seq
         }
 
         vdprintf("[PACKET RECEIVE WINDNS] recv. error %d", dns_status);
-        recieve->status = ERROR_READ_FAULT;
+        recieve->status = dns_status;
         recieve->size = 0;
         return FALSE;
     }
 
-    vdprintf("[PACKET RECEIVE WINDNS] packet recieved with size (%d)", recieve->size);
+    vdprintf("[PACKET RECEIVE WINDNS] packet received with size (%d)", recieve->size);
     return TRUE;
 }
 
@@ -952,14 +1093,14 @@ BOOL get_packet_from_windns(WORD request_type, wchar_t *domain, wchar_t *sub_seq
  */
 static BOOL send_request_windns(WORD request_type, wchar_t *domain, wchar_t *subdomain, wchar_t *reqz,
                                 PUSHORT counter, PIP4_ARRAY pip4, LPVOID buffer, DWORD size,
-                                wchar_t *client_id, IncapsulatedDns *recieved)
+                                wchar_t *client_id, IncapsulatedDns *received)
 {
     BOOL result = FALSE;
 
     if (buffer == NULL || size == 0)
     {
         result = get_packet_from_windns(request_type, domain, subdomain, counter,
-                                        recieved, pip4, reqz, client_id);
+                                        received, pip4, reqz, client_id);
     }
     else if (buffer != NULL && size > 0)
     {
@@ -1145,7 +1286,7 @@ static BOOL register_dns(DnsTransportContext *ctx)
         DnsRecordsHanlder *handler = get_records_handler(context->request_type);
         if ((handler != NULL) && (handler->on_register != NULL))
         {
-            handler->on_register(context->records, ctx);
+            dns_status = handler->on_register(context->records, ctx);
         }
         else
         {
@@ -1164,9 +1305,10 @@ static BOOL register_dns(DnsTransportContext *ctx)
  * @return An indication of the result of processing the transmission request.
  * @remark This function is not available in POSIX.
  */
-static DWORD packet_receive_dns(Remote *remote, Packet **packet)
+static  eDnsStatus packet_receive_dns(Remote *remote, Packet **packet)
 {
-    DWORD headerBytes = 0, payloadBytesLeft = 0, res = ERROR_SUCCESS;
+    DWORD headerBytes = 0, payloadBytesLeft = 0;
+    eDnsStatus res = eSTATUS_SUCCESS;
     Packet *localPacket = NULL;
     PacketHeader header;
     //LONG bytesRead;
@@ -1175,26 +1317,43 @@ static DWORD packet_receive_dns(Remote *remote, Packet **packet)
     ULONG payloadLength = 0;
     DnsTransportContext *ctx = (DnsTransportContext *)remote->transport->ctx;
     DWORD retries = 5;
-    IncapsulatedDns recieved;
+    IncapsulatedDns received;
     wchar_t *sub_seq = L"aaaa";
 
-    recieved.packet = NULL;
+    received.packet = NULL;
 
     lock_acquire(remote->lock);
+
+    if (ctx->ready == FALSE)
+    {
+        // Register
+        vdprintf("[PACKET RECEIVE DNS] sending reg req: %S", ctx->domain);
+        BOOL rcvStatus = register_dns(ctx);
+
+        if (rcvStatus == TRUE) // Handle response
+        {
+            vdprintf("[PACKET RECEIVE DNS] Registred. New CLIENT ID: '%S'", ctx->client_id);
+        }
+        else
+        {
+            vdprintf("[PACKET RECEIVE DNS] Registration failed!");
+            res = eSTATUS_DNS_ERROR;
+        }
+    }
 
     if (ctx->ready == TRUE)
     {
         vdprintf("[PACKET RECEIVE DNS] sending req: %S", ctx->domain);
         BOOL rcvStatus = send_request_windns(ctx->request_type, ctx->domain, sub_seq, L"g",
                                              &ctx->counter, ctx->pip4, NULL, 0, ctx->client_id,
-                                             &recieved);
+                                             &received);
 
-        if (rcvStatus == TRUE && recieved.status == ERROR_SUCCESS) // Handle response
+        if (rcvStatus == TRUE && received.status == eSTATUS_SUCCESS) // Handle response
         {
-            vdprintf("[PACKET RECEIVE DNS] Data recieved: %u bytes", recieved.size);
+            vdprintf("[PACKET RECEIVE DNS] Data received: %u bytes", received.size);
 
             //read header
-            memcpy(&header, recieved.packet, sizeof(PacketHeader));
+            memcpy(&header, received.packet, sizeof(PacketHeader));
             dprintf("[PACKET RECEIVE DNS] decoding header");
 
             // xor the header data
@@ -1222,7 +1381,7 @@ static DWORD packet_receive_dns(Remote *remote, Packet **packet)
             else
             {
                 dprintf("[PACKET RECEIVE DNS] alloc %d", packetSize);
-                memcpy_s(payload, packetSize, recieved.packet, packetSize);
+                memcpy_s(payload, packetSize, received.packet, packetSize);
 
 #ifdef DEBUGTRACE
                 h = (PUCHAR)&header.session_guid[0];
@@ -1267,41 +1426,14 @@ static DWORD packet_receive_dns(Remote *remote, Packet **packet)
                 }
             }
         }
-        else if (recieved.status == DNS_INFO_NO_RECORDS) // No data
-        {
-            SetLastError(DNS_INFO_NO_RECORDS);
-            res = DNS_INFO_NO_RECORDS;
-        }
-        else if (recieved.status == ERROR_READ_FAULT)
-        { // ERROR
-
-            SetLastError(ERROR_READ_FAULT);
-            res = ERROR_READ_FAULT;
-        }
         else
         {
-            SetLastError(ERROR_READ_FAULT);
-            res = ERROR_READ_FAULT;
+            res = received.status;
         }
     }
     else
-    { // Register
-
-        vdprintf("[PACKET RECEIVE DNS] sending reg req: %S", ctx->domain);
-        BOOL rcvStatus = register_dns(ctx);
-
-        if (rcvStatus == TRUE) // Handle response
-        {
-            vdprintf("[PACKET RECEIVE DNS] Registred. New CLIENT ID: '%S'", ctx->client_id);
-            SetLastError(DNS_INFO_NO_RECORDS);
-            res = DNS_INFO_NO_RECORDS;
-        }
-        else
-        {
-            vdprintf("[PACKET RECEIVE DNS] Registration failed!");
-            SetLastError(DNS_INFO_NO_RECORDS);
-            res = DNS_INFO_NO_RECORDS;
-        }
+    {
+        res = eSTATUS_DNS_ERROR;
     }
 
     lock_release(remote->lock);
@@ -1377,6 +1509,7 @@ static DWORD server_dispatch_dns(Remote *remote, THREAD *dispatchThread)
 {
     BOOL running = TRUE;
     LONG result = ERROR_SUCCESS;
+    eDnsStatus dns_status = eSTATUS_SUCCESS;
     Packet *packet = NULL;
     THREAD *cpt = NULL;
     DWORD ecount = 0;
@@ -1407,14 +1540,9 @@ static DWORD server_dispatch_dns(Remote *remote, THREAD *dispatchThread)
 
         dprintf("[DISPATCH] Reading data from the DNS: %S", ctx->domain);
 
-        result = packet_receive_dns(remote, &packet);
-        if (result != ERROR_SUCCESS)
+        dns_status = packet_receive_dns(remote, &packet);
+        if (dns_status != eSTATUS_SUCCESS)
         {
-            // Update the timestamp for empty replies
-            if (result == DNS_INFO_NO_RECORDS)
-            {
-                transport->comms_last_packet = current_unix_timestamp();
-            }
             delay = 10 * ecount;
             if (ecount >= 10)
             {
@@ -1453,6 +1581,7 @@ static void transport_destroy_dns(Transport *transport)
         SAFE_FREE(ctx->ns_server);
         SAFE_FREE(ctx->server_id);
         SAFE_FREE(ctx->pip4);
+        SAFE_FREE(ctx->client_id);
         ctx->ready = FALSE;
     }
     SAFE_FREE(transport);
@@ -1538,6 +1667,7 @@ Transport *transport_create_dns(MetsrvTransportDns *config)
     //REQUEST TYPE
     r_type = parse_url(transport->url, L"req=", L"&");
     ctx->request_type = _wtoi(r_type);
+    SAFE_FREE(r_type);
     dprintf("[TRANS DNS] REQUEST %S = %d", r_type, ctx->request_type);
 
     ///////////////////

@@ -10,14 +10,6 @@
 #pragma comment (lib, "Dnsapi.lib")
 
 #pragma pack(push, 1)
-typedef struct _IncapsulatedDns
-{
-	size_t size;
-	PUCHAR packet;
-	USHORT status;
-} IncapsulatedDns;
-
-
 typedef struct _DnsReverseHeader
 {
 	BYTE next_sub_seq[8];
@@ -37,23 +29,11 @@ typedef struct _DnsIPv6Tunnel
 {
 	BYTE ff;
 	BYTE index_size;
-	DnsData block;
+	union {
+		BYTE data[14];
+		DnsReverseHeader header;
+	} block;
 } DnsIPv6Tunnel;
-
-typedef struct _DNSThreadParams
-{
-	PHANDLE mutex;
-	size_t index;
-    size_t index_stop;
-	WORD request_type;
-	wchar_t *subd;
-	wchar_t *domain;
-    wchar_t *client_id;
-	PIP4_ARRAY pSrvList;
-	UINT size;
-    UINT status;
-	UCHAR *result;
-} DNSThreadParams;
 #pragma pack(pop)
 
 void transport_write_dns_config(Transport* transport, MetsrvTransportDns* config);
