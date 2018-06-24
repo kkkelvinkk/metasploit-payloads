@@ -966,6 +966,7 @@ class TimeoutService(object):
         self.lock = threading.RLock()
         self.listeners = set()
         self.one_shot_listeners = set()
+        self.shutdownEvt = threading.Event()
 
     def _setup_timer(self):
         if self.timer:
@@ -982,9 +983,13 @@ class TimeoutService(object):
                 self.timer.cancel()
             self.listeners = None
             self.one_shot_listeners = None
+            self.shutdownEvt.set()
 
     def timer_expired(self):
         with self.lock:
+            if self.shutdownEvt.is_set():
+                return
+
             for listener in (self.listeners | self.one_shot_listeners):
                 cur_time = int(time.time())
                 listener(cur_time)
@@ -998,6 +1003,9 @@ class TimeoutService(object):
 
     def add_callback(self, callback, one_shot=False):
         with self.lock:
+            if self.shutdownEvt.is_set():
+                return
+
             listeners = self.one_shot_listeners if one_shot else self.listeners
             no_listeners = self._empty_listeners()
             listeners.add(callback)
@@ -1006,6 +1014,9 @@ class TimeoutService(object):
 
     def remove_callback(self, callback):
         with self.lock:
+            if self.shutdownEvt.is_set():
+                return
+
             with ignored(KeyError):
                 self.listeners.remove(callback)
             if self._empty_listeners() and self.timer is not None:
