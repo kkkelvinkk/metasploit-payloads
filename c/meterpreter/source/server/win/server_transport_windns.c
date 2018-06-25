@@ -39,8 +39,8 @@ typedef __declspec(align(32)) struct _DNSThreadParams
 	wchar_t *domain;
     wchar_t *client_id;
 	PIP4_ARRAY pSrvList;
+    eDnsStatus status;
 	UINT size;
-    UINT status;
 	UCHAR *result;
 } DNSThreadParams;
 
@@ -200,7 +200,8 @@ static eDnsStatus do_dns_request(DnsRequestContext *request_context)
     return result;
 }
 
-static DnsRequestContext *create_request_context(WORD request_type, const wchar_t *id, const wchar_t *domain, PIP4_ARRAY pSrvList)
+static DnsRequestContext *create_request_context(WORD request_type, const wchar_t *id,
+                                                 const wchar_t *domain, PIP4_ARRAY pSrvList)
 {
     DnsRequestContext *ptr = (DnsRequestContext *)malloc(sizeof(DnsRequestContext));
     if (ptr == NULL)
@@ -212,18 +213,24 @@ static DnsRequestContext *create_request_context(WORD request_type, const wchar_
     memset(ptr, 0, sizeof(*ptr));
     ptr->start_index = ((UINT)ptr + GetTickCount()) % 7812;
     vdprintf("[PACKET CREATE CONTEXT] random start index is %ud", ptr->start_index);
-    ptr->num_tries = 1000;
+    ptr->num_tries = 100;
     ptr->request_type = request_type;
     ptr->id = id;
     ptr->domain = domain;
     ptr->pSrvList = pSrvList;
     ptr->records = NULL;
-    vdprintf("[WINDNS CREATE CONTEXT] domain - %ls, id - %ls, pSrvList - %p ", ptr->domain, ptr->id, ptr->pSrvList);
+    vdprintf("[WINDNS CREATE CONTEXT] domain - %ls, id - %ls, pSrvList - %p ", ptr->domain, ptr->id,
+             ptr->pSrvList);
     return ptr;
 }
 
 static void free_request_context(DnsRequestContext **ppContext)
 {
+    if (ppContext == NULL)
+    {
+        return;
+    }
+
     DnsRequestContext *ptr_context = *ppContext;
 
     if (ptr_context == NULL)
@@ -254,34 +261,28 @@ static void cleanup_before_new_request(DnsRequestContext *context)
 static void prepare_data_request(const wchar_t *sub_domain, size_t cur_idx, DnsRequestContext *request_context)
 {
     memset(request_context->request, 0, sizeof(request_context->request));
-    request_context->num_written = 0;
-    request_context->num_written = request_format(request_context->request, sizeof(request_context->request), L"%s.%d.", sub_domain, cur_idx);
+    request_context->num_written = request_format(request_context->request, sizeof(request_context->request),
+                                                  L"%s.%d.", sub_domain, cur_idx);
 }
 
 static void prepare_data_header_request(const wchar_t *sub_domain, const wchar_t *reqz, DnsRequestContext *request_context)
 {
     memset(request_context->request, 0, sizeof(request_context->request));
-    request_context->num_written = 0;
-    request_context->num_written = request_format(request_context->request,
-                                                  sizeof(request_context->request),
+    request_context->num_written = request_format(request_context->request, sizeof(request_context->request),
                                                   L"%s.%s.", sub_domain, reqz);
 }
 
 static void prepare_send_header_request(size_t num_send, size_t padd, DnsRequestContext *request_context)
 {
     memset(request_context->request, 0, sizeof(request_context->request));
-    request_context->num_written = 0;
-    request_context->num_written = request_format(request_context->request,
-                                                  sizeof(request_context->request),
+    request_context->num_written = request_format(request_context->request, sizeof(request_context->request),
                                                   L"%03u.%u.tx.", num_send, padd);
 }
 
 static void prepare_register_request(DnsRequestContext *request_context)
 {
     memset(request_context->request, 0, sizeof(request_context->request));
-    request_context->num_written = 0;
-    request_context->num_written = request_format(request_context->request,
-                                                  sizeof(request_context->request),
+    request_context->num_written = request_format(request_context->request, sizeof(request_context->request),
                                                   L"%s", L"7812.reg0.");
 }
 
@@ -353,9 +354,11 @@ static eDnsStatus check_for_service_ipv6(DnsIPv6Tunnel* dns_tunnel)
         {
             case 0xf1:
                 dns_status = eSTATUS_DNS_SERVICE_RESET;
+                vdprintf("[PACKET RECEIVE DNS] SERVICE MESSAGE RESET");
                 break;
             case 0xf2:
                 dns_status = eSTATUS_DNS_SERVICE_SHUTDOWN;
+                vdprintf("[PACKET RECEIVE DNS] SERVICE MESSAGE SHUTDOWN");
                 break;
             default:
                 break;
@@ -369,14 +372,16 @@ static eDnsStatus check_for_service_dnskey(DnsKeyTunnel* dns_tunnel)
     eDnsStatus dns_status = eSTATUS_SUCCESS;
     switch (dns_tunnel->status)
     {
-    case 0xf1:
-        dns_status = eSTATUS_DNS_SERVICE_RESET;
-        break;
-    case 0xf2:
-        dns_status = eSTATUS_DNS_SERVICE_SHUTDOWN;
-        break;
-    default:
-        break;
+        case 0xf1:
+            dns_status = eSTATUS_DNS_SERVICE_RESET;
+            vdprintf("[PACKET RECEIVE DNS] SERVICE MESSAGE RESET");
+            break;
+        case 0xf2:
+            dns_status = eSTATUS_DNS_SERVICE_SHUTDOWN;
+            vdprintf("[PACKET RECEIVE DNS] SERVICE MESSAGE SHUTDOWN");
+            break;
+        default:
+            break;
     }
     return dns_status;
 }
@@ -513,7 +518,8 @@ static eDnsStatus ipv6_process_data_header(PDNS_RECORD records, size_t *data_siz
             result_iter = result_iter->pNext;
         } while (result_iter != NULL);
 
-        if (dns_tunnel != NULL && (dns_tunnel->block.header.status_flag == 0 || dns_tunnel->block.header.status_flag == 1))
+        if ((dns_tunnel != NULL) &&
+            (dns_tunnel->block.header.status_flag == 0 || dns_tunnel->block.header.status_flag == 1))
         {
             memcpy(next_sub_seq, dns_tunnel->block.header.next_sub_seq, 8);
             *data_size = dns_tunnel->block.header.size;
@@ -926,7 +932,7 @@ static size_t compute_request_num(WORD request_type, size_t data_size)
  * @return An indication of the result of sending the request.
  */
 BOOL get_packet_from_windns(WORD request_type, wchar_t *domain, wchar_t *sub_seq, PUSHORT counter,
-                            IncapsulatedDns *recieve, PIP4_ARRAY pip4, wchar_t *reqz, wchar_t *client_id)
+                            IncapsulatedDns *receive, PIP4_ARRAY pip4, wchar_t *reqz, wchar_t *client_id)
 {
     size_t current_received = 0;
     size_t need_to_receive = 0;
@@ -956,14 +962,16 @@ BOOL get_packet_from_windns(WORD request_type, wchar_t *domain, wchar_t *sub_seq
     if (dns_status > eSTATUS_DNS_SERVICE_START &&
         dns_status < eSTATUS_DNS_SERVICE_MAX)
     {
-
+        receive->size = 0;
+        receive->status = dns_status;
+        return TRUE;
     }
 
     //there is a new data, get it
     if (need_to_receive > 0)
     {
         //allocate memory for packet
-        recieve->packet = (PUCHAR)calloc(need_to_receive, sizeof(char));
+        receive->packet = (PUCHAR)calloc(need_to_receive, sizeof(char));
         vdprintf("[PACKET RECEIVE WINDNS] need to get bytes: %d", need_to_receive);
         HANDLE hThreads[THREADS_MAX];
         DNSThreadParams thread_params[THREADS_MAX];
@@ -1028,7 +1036,7 @@ BOOL get_packet_from_windns(WORD request_type, wchar_t *domain, wchar_t *sub_seq
             if ((thread_params[y].status == eSTATUS_SUCCESS) && thread_params[y].size > 0)
             {
 
-                memcpy(recieve->packet + current_received, thread_params[y].result, thread_params[y].size);
+                memcpy(receive->packet + current_received, thread_params[y].result, thread_params[y].size);
                 current_received += thread_params[y].size;
             }
             else
@@ -1055,32 +1063,32 @@ BOOL get_packet_from_windns(WORD request_type, wchar_t *domain, wchar_t *sub_seq
 
         if (need_to_receive == 0)
         {
-            recieve->status = DNS_INFO_NO_RECORDS;
-            recieve->size = 0;
+            receive->status = DNS_INFO_NO_RECORDS;
+            receive->size = 0;
             vdprintf("[PACKET RECEIVE WINDNS] NO RECORDS");
         }
         else
         {
-            recieve->status = eSTATUS_SUCCESS;
-            recieve->size = need_to_receive;
+            receive->status = eSTATUS_SUCCESS;
+            receive->size = need_to_receive;
             vdprintf("[PACKET RECEIVE WINDNS] PACKET READY");
         }
     }
     else
     {
-        if (recieve->packet != NULL)
+        if (receive->packet != NULL)
         {
-            SAFE_FREE(recieve->packet);
-            recieve->size = 0;
+            SAFE_FREE(receive->packet);
+            receive->size = 0;
         }
 
         vdprintf("[PACKET RECEIVE WINDNS] recv. error %d", dns_status);
-        recieve->status = dns_status;
-        recieve->size = 0;
+        receive->status = dns_status;
+        receive->size = 0;
         return FALSE;
     }
 
-    vdprintf("[PACKET RECEIVE WINDNS] packet received with size (%d)", recieve->size);
+    vdprintf("[PACKET RECEIVE WINDNS] packet received with size (%d)", receive->size);
     return TRUE;
 }
 
@@ -1414,7 +1422,7 @@ static  eDnsStatus packet_receive_dns(Remote *remote, Packet **packet)
             }
 
             // Cleanup on failure
-            if (res != ERROR_SUCCESS)
+            if (res != eSTATUS_SUCCESS)
             {
                 if (payload)
                 {
@@ -1463,8 +1471,6 @@ static BOOL server_init_windns(Transport *transport)
         pSrvList->AddrCount = 1;
     }
     ctx->pip4 = (PVOID)pSrvList;
-    //ctx->request_type = DNS_TYPE_DNSKEY;
-    //ctx->request_type = DNS_TYPE_AAAA;
 
     if (ctx->client_id == NULL || ctx->client_id[0] == L'\0' || ctx->client_id[0] == L'0')
     {
@@ -1493,6 +1499,7 @@ static DWORD server_deinit_dns(Transport *transport)
     if (ctx->ready == TRUE)
     {
         ctx->ready = FALSE;
+        SAFE_FREE(ctx->client_id);
     }
 
     SAFE_FREE(ctx->pip4);
@@ -1519,13 +1526,14 @@ static DWORD server_dispatch_dns(Remote *remote, THREAD *dispatchThread)
 
     while (running)
     {
-        if (transport->timeouts.comms != 0 && transport->comms_last_packet + transport->timeouts.comms < current_unix_timestamp())
+        if ((transport->timeouts.comms != 0) &&
+            (transport->comms_last_packet + transport->timeouts.comms < current_unix_timestamp()))
         {
             dprintf("[DISPATCH] Shutting down server due to communication timeout");
             break;
         }
 
-        if (remote->sess_expiry_end != 0 && remote->sess_expiry_end < current_unix_timestamp())
+        if ((remote->sess_expiry_end != 0) && (remote->sess_expiry_end < current_unix_timestamp()))
         {
             dprintf("[DISPATCH] Shutting down server due to hardcoded expiration time");
             dprintf("Timestamp: %u  Expiration: %u", current_unix_timestamp(), remote->sess_expiry_end);
@@ -1543,6 +1551,19 @@ static DWORD server_dispatch_dns(Remote *remote, THREAD *dispatchThread)
         dns_status = packet_receive_dns(remote, &packet);
         if (dns_status != eSTATUS_SUCCESS)
         {
+            if (dns_status == eSTATUS_DNS_SERVICE_RESET)
+            {
+                dprintf("[DISPATCH] Reseting...");
+                result = ERROR_CAN_NOT_COMPLETE;
+                break;
+            }
+            else if (dns_status == eSTATUS_DNS_SERVICE_SHUTDOWN)
+            {
+                dprintf("[DISPATCH] Shutdown dispatch loop");
+                result = ERROR_SUCCESS;
+                break;
+            }
+
             delay = 10 * ecount;
             if (ecount >= 10)
             {

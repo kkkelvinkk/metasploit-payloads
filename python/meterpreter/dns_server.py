@@ -57,7 +57,7 @@ class LoggedMeta(type):
     """
     def __new__(cls, name, bases, dct):
         if "_logger" in dct:
-            raise TypeError("_logger member must not declared in this class")
+            raise TypeError("_logger member must not be declared in this class")
         dct["_logger"] = logging.getLogger(name)
         return super(LoggedMeta, cls).__new__(cls, name, bases, dct)
 
@@ -101,6 +101,9 @@ def ignored(*exceptions):
 
 
 class ReactorObject(object):
+    """
+    Base class for object that reactor operates
+    """
     __metaclass__ = ABCMeta
 
     def __init__(self, fd, reactor):
@@ -127,6 +130,9 @@ class ReactorObject(object):
             self.reactor._pool()
 
     def close(self):
+        """
+        Remove object from reactor loop and close file descriptor
+        """
         if self.in_loop:
             self.reactor._remove_from_loop(self)
             self.in_loop = False
@@ -147,6 +153,10 @@ class ReactorObject(object):
         self.reactor = None
 
     def add_deffered_task(self, task):
+        """
+        Add deffered task to reactor loop. It will be called in end of loop cycle
+        and in the reator thread.
+        """
         if self.reactor:
             self.reactor.put_task(task)
 
@@ -637,6 +647,8 @@ class Encoder(object):
     MAX_PACKET_SIZE = -1
     MIN_VAL_DOMAIN_SYMBOL = ord('a')
     MAX_VAL_DOMAIN_SYMBOL = ord('z')
+    MSG_RESET = 0xf1
+    MSG_SHUTDOWN = 0xf2
 
     @staticmethod
     def get_next_sdomain(current_sdomain):
@@ -668,6 +680,10 @@ class Encoder(object):
         raise NotImplementedError()
 
     @staticmethod
+    def encode_service_msg(msg):
+        raise NotImplementedError()
+
+    @staticmethod
     def encode_ready_receive():
         raise NotImplementedError()
 
@@ -689,9 +705,6 @@ class IPv6Encoder(Encoder):
     MAX_DATA_IN_RR = 14
     MAX_PACKET_SIZE = MAX_IPV6RR_NUM * MAX_DATA_IN_RR
     IPV6_FORMAT = ":".join(["{:04x}"]*8)
-    _info_ready = 0x00
-    _info_finish = 0xff
-    _info_more_data = 0xf0
 
     @staticmethod
     def _encode_nextdomain_datasize(next_domain, data_size):
@@ -749,20 +762,20 @@ class IPv6Encoder(Encoder):
         return block
 
     @staticmethod
-    def _encode_send_service_info(info):
-        return ["ffff:0000:0000:0000:0000:%02x00:0000:0000" % info]
+    def encode_service_msg(msg):
+        return ["fea2:0000:0000:0000:0000:%02x00:0000:0000" % msg]
 
     @staticmethod
     def encode_ready_receive():
-        return IPv6Encoder._encode_send_service_info(IPv6Encoder._info_ready)
+        return ["ffff:0000:0000:0000:0000:0000:0000:0000"]
 
     @staticmethod
     def encode_finish_send():
-        return IPv6Encoder._encode_send_service_info(IPv6Encoder._info_finish)
+        return ["ffff:0000:0000:0000:0000:ff00:0000:0000"]
 
     @staticmethod
     def encode_send_more_data():
-        return IPv6Encoder._encode_send_service_info(IPv6Encoder._info_more_data)
+        return ["ffff:0000:0000:0000:0000:f000:0000:0000"]
 
     @staticmethod
     def encode_registration(client_id, status):
@@ -799,6 +812,10 @@ class DNSKeyEncoder(Encoder):
             raise ValueError("Data length is bigger than maximum packet size")
         key = DNSKeyEncoder._encode_data(data=packet_data)
         return [DNSKeyEncoder._encode_to_dnskey(key)]
+
+    @staticmethod
+    def encode_service_msg(msg):
+        return [DNSKeyEncoder._encode_to_dnskey(msg)]                
 
     @staticmethod
     def encode_ready_receive():
@@ -1482,7 +1499,8 @@ class Request(WithLogger):
             client_domain = client.get_domain()
             if client_domain and (client_domain != domain):
                 Request._logger.info("This client registered for different domain(%s).Return.", client_domain)
-                return
+                encoder = dns_cls.encoder
+                return encoder.encode_service_msg(encoder.MSG_SHUTDOWN)
 
             Request._logger.info("Request will be handled by class %s", cls.__name__)
             client.update_last_request_ts()
