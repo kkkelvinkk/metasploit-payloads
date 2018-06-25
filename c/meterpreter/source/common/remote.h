@@ -112,6 +112,7 @@ typedef struct _DnsTransportContext
 	USHORT counter;
 	DWORD type;
 	PVOID pip4;
+	wchar_t sub_seq[5];
 } DnsTransportContext;
 
 typedef struct _Transport

@@ -212,7 +212,7 @@ static DnsRequestContext *create_request_context(WORD request_type, const wchar_
 
     memset(ptr, 0, sizeof(*ptr));
     ptr->start_index = ((UINT)ptr + GetTickCount()) % 7812;
-    vdprintf("[PACKET CREATE CONTEXT] random start index is %ud", ptr->start_index);
+    vdprintf("[PACKET CREATE CONTEXT] random start index is %u", ptr->start_index);
     ptr->num_tries = 100;
     ptr->request_type = request_type;
     ptr->id = id;
@@ -1326,8 +1326,6 @@ static  eDnsStatus packet_receive_dns(Remote *remote, Packet **packet)
     DnsTransportContext *ctx = (DnsTransportContext *)remote->transport->ctx;
     DWORD retries = 5;
     IncapsulatedDns received;
-    wchar_t *sub_seq = L"aaaa";
-
     received.packet = NULL;
 
     lock_acquire(remote->lock);
@@ -1340,7 +1338,7 @@ static  eDnsStatus packet_receive_dns(Remote *remote, Packet **packet)
 
         if (rcvStatus == TRUE) // Handle response
         {
-            vdprintf("[PACKET RECEIVE DNS] Registred. New CLIENT ID: '%S'", ctx->client_id);
+            vdprintf("[PACKET RECEIVE DNS] Registered. New CLIENT ID: '%S'", ctx->client_id);
         }
         else
         {
@@ -1352,7 +1350,7 @@ static  eDnsStatus packet_receive_dns(Remote *remote, Packet **packet)
     if (ctx->ready == TRUE)
     {
         vdprintf("[PACKET RECEIVE DNS] sending req: %S", ctx->domain);
-        BOOL rcvStatus = send_request_windns(ctx->request_type, ctx->domain, sub_seq, L"g",
+        BOOL rcvStatus = send_request_windns(ctx->request_type, ctx->domain, ctx->sub_seq, L"g",
                                              &ctx->counter, ctx->pip4, NULL, 0, ctx->client_id,
                                              &received);
 
@@ -1471,6 +1469,8 @@ static BOOL server_init_windns(Transport *transport)
         pSrvList->AddrCount = 1;
     }
     ctx->pip4 = (PVOID)pSrvList;
+    wcscpy_s(ctx->sub_seq, 4, L"aaaa"); 
+    ctx->sub_seq[4] = L'\0';
 
     if (ctx->client_id == NULL || ctx->client_id[0] == L'\0' || ctx->client_id[0] == L'0')
     {
@@ -1479,7 +1479,7 @@ static BOOL server_init_windns(Transport *transport)
     }
     else
     {
-        dprintf("[WINDNS] DNS already registred with CLIENT_ID %S", ctx->client_id);
+        dprintf("[WINDNS] DNS already registered with CLIENT_ID %S", ctx->client_id);
         ctx->ready = TRUE;
     }
     return TRUE;
