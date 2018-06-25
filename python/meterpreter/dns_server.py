@@ -815,7 +815,7 @@ class DNSKeyEncoder(Encoder):
 
     @staticmethod
     def encode_service_msg(msg):
-        return [DNSKeyEncoder._encode_to_dnskey(msg)]                
+        return [DNSKeyEncoder._encode_to_dnskey(struct.pack("B", msg))]                
 
     @staticmethod
     def encode_ready_receive():
@@ -1058,6 +1058,7 @@ class Client(WithLogger):
         self.lock = threading.Lock()
         self.registrator = registrator
         self.proxy = None
+        self._num_resets = 0
 
     def update_last_request_ts(self):
         self.ts = int(time.time())
@@ -1097,14 +1098,22 @@ class Client(WithLogger):
         self.last_received_index = -1
         self.padding = 0
 
+    def _reset(self, encoder):
+        self._num_resets += 1
+        self._logger.info("Reset client(%d)", self._num_resets)
+        return encoder.encode_service_msg(encoder.MSG_RESET if self._num_resets < 5 else encoder.MSG_SHUTDOWN)
+
     def incoming_data_header(self, data_size, padding, encoder):
         if self.received_data.get_expected_size() == data_size and self.state == self.INCOMING_DATA:
             self._logger.info("Duplicated header request: waiting %d bytes of data with padding %d", data_size, padding)
             return encoder.encode_ready_receive()
         elif self.state == self.INCOMING_DATA:
             self._logger.error("Bad request. Client in the receiving data state")
-            return None
+            return self._reset(encoder)
         self._logger.info("Data header: waiting %d bytes of data", data_size)
+        if data_size == 0:
+            self._logger.error("Data size is zero.")
+            self._reset(encoder)
         self._setup_receive(data_size, padding)
         return encoder.encode_ready_receive()
 
@@ -1112,12 +1121,12 @@ class Client(WithLogger):
         self._logger.debug("Data %s, index %d", data, index)
         if self.state != self.INCOMING_DATA:
             self._logger.error("Bad state(%d) for this action. Send finish.", self.state)
-            return encoder.encode_finish_send()
+            return self._reset(encoder)
 
         data_size = len(data)
         if data_size == 0:
-            self._logger.error("Empty incoming data. Send finish.")
-            return encoder.encode_finish_send()
+            self._logger.error("Empty incoming data. Send reset.")
+            return self._reset(encoder)
 
         if self.last_received_index >= index:
             self._logger.info("Duplicated packet.")
@@ -1128,7 +1137,7 @@ class Client(WithLogger):
         except ValueError:
             self._logger.error("Overflow.Something was wrong. Send finish and clear all received data.")
             self._initial_state()
-            return encoder.encode_finish_send()
+            return self._reset(encoder)
 
         self.last_received_index = index
         if self.received_data.is_complete():
@@ -1141,46 +1150,52 @@ class Client(WithLogger):
             except Exception:
                 self._logger.error("Error during decode received data", exc_info=True)
                 self._initial_state()
-                return encoder.encode_finish_send()
+                return self._reset(encoder) 
+
         return encoder.encode_send_more_data()
 
     def request_data_header(self, sub_domain, encoder):
-        if sub_domain == self.sub_domain:
-            if not self.proxy:
-                self.proxy = self.registrator.register_client_for_server(self.server_id, self)
-
-            if not self.send_data:
-                self._logger.info("Checking client queue...")
-                data = self.proxy.receive()
-                if data:
-                    self.send_data = BlockSizedData(data, encoder.MAX_PACKET_SIZE)
-                    self._logger.debug("New data found: size is %d", len(data))
-
-            data_size = 0
-            if self.send_data:
-                next_sub = encoder.get_next_sdomain(self.sub_domain)
-                sub_domain = next_sub
-                data_size = self.send_data.get_size()
-            else:
-                self._logger.info("No data for client.")
-            self._logger.info("Send data header to client with domain %s and size %d", sub_domain, data_size)
-            return encoder.encode_data_header(sub_domain, data_size)
-        else:
+        if sub_domain != self.sub_domain:
             self._logger.info("Subdomain is different %s(request) - %s(client)", sub_domain, self.sub_domain)
+            next_sub = encoder.get_next_sdomain(self.sub_domain)
+            if sub_domain != next_sub:
+                # if not the next sub_domain then reset it
+                return self._reset(encoder) 
+
             if sub_domain == "aaaa":
                 self._logger.info("MIGRATION.")
             self.sub_domain = sub_domain
             self.send_data = None
 
+        if not self.proxy:
+            self.proxy = self.registrator.register_client_for_server(self.server_id, self)
+
+        if not self.send_data:
+            self._logger.info("Checking client queue...")
+            data = self.proxy.receive()
+            if data:
+                self.send_data = BlockSizedData(data, encoder.MAX_PACKET_SIZE)
+                self._logger.debug("New data found: size is %d", len(data))
+
+        data_size = 0
+        if self.send_data:
+            next_sub = encoder.get_next_sdomain(self.sub_domain)
+            sub_domain = next_sub
+            data_size = self.send_data.get_size()
+        else:
+            self._logger.info("No data for client.")
+        self._logger.info("Send data header to client with domain %s and size %d", sub_domain, data_size)
+        return encoder.encode_data_header(sub_domain, data_size)
+
     def request_data(self, sub_domain, index, encoder):
         self._logger.debug("request_data - %s, %d", sub_domain, index)
         if sub_domain != self.sub_domain:
             self._logger.error("request_data: subdomains are not equal(%s-%s)", self.sub_domain, sub_domain)
-            return None
+            return encoder.encode_service_msg(encoder.MSG_RESET)
 
         if not self.send_data:
             self._logger.error("Bad request. There are no data.")
-            return None
+            return encoder.encode_service_msg(encoder.MSG_RESET)
 
         try:
             _, data = self.send_data.get_data(index)
@@ -1188,6 +1203,7 @@ class Client(WithLogger):
             return encoder.encode_packet(data)
         except ValueError:
             self._logger.error("request_data: index(%d) out of range.", index)
+            return self._reset(encoder) 
 
     def on_timeout(self):
         if self.proxy:
@@ -1507,7 +1523,9 @@ class Request(WithLogger):
             params["encoder"] = dns_cls.encoder
             return cls._handle_client(client, **params)
         else:
-            Request._logger.error("Can't find client with name %s", client_id)
+            Request._logger.error("Can't find client with name '%s'.Trying to reset it", client_id)
+            encoder = dns_cls.encoder
+            return encoder.encode_service_msg(encoder.MSG_RESET)
 
     @classmethod
     def _handle_client(cls, client, **kwargs):
