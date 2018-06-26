@@ -568,7 +568,8 @@ class ReceiveTask(RConnectionTask):
 
     @RConnectionTask.error_f
     def _on_error(self):
-        pass
+        if self.error_func:
+            self.error_func()
 
     @RConnectionTask.done_f
     def _done(self, connection):
@@ -582,6 +583,10 @@ class SendTask(RConnectionTask):
         self.data = data
         self.need_send = len(data)
         self.idx = 0
+        self.error_func = None
+
+    def set_error_func(self, error_func=None):
+        self.error_func = error_func
 
     @RConnectionTask.work_f
     def _send_data(self, connection):
@@ -595,11 +600,13 @@ class SendTask(RConnectionTask):
 
     @RConnectionTask.error_f
     def _on_error(self):
-        pass
+        if self.error_func:
+            self.error_func()
 
     @RConnectionTask.done_f
     def _done(self, connection):
         pass
+
 
 def connection_task(func):
     if not callable(func):
@@ -1266,13 +1273,20 @@ class SDnsConnector(WithLogger):
         client_proxy = None
         with self.lock, ignored(IndexError):
             clients = clientMap.get(server_id, deque())
-            client_proxy = clients.popleft()        
+            client_proxy_ref = clients.popleft()        
+            while client_proxy_ref:
+                client_proxy = client_proxy_ref()
+                if client_proxy:
+                    break
+                else:
+                    client_proxy_ref = clients.popleft()        
         return client_proxy
 
     def _update_map(self, clientMap, server_id, proxy):
         with self.lock:
             if not proxy.is_paired():
-                clientMap.setdefault(server_id, deque()).append(proxy)
+                ref_proxy = weakref.ref(proxy)
+                clientMap.setdefault(server_id, deque()).append(ref_proxy)
 
     def _append_socket(self, server_id, proxy):
         self._update_map(self.socketClientMap, server_id, proxy)
@@ -1824,7 +1838,8 @@ class BaseRequestHandlerDNS(SocketServer.BaseRequestHandler):
             logger.debug("Size:%d, data %s", len(data), data)
             dns_ans = dns_response(data, self.TRANSPORT)
             if dns_ans:
-                self.send_data(dns_ans)
+                with ignored(socket.error):
+                    self.send_data(dns_ans)
         except Exception:
             logger.error("Exception in request handler.", exc_info=True)
 
@@ -1855,11 +1870,17 @@ class LSClient(WithLogger):
     def _connection_error(self):
         self._logger.info("Error or closed connection")
         if self.proxy:
-            self.proxy.close()
+            self.proxy.disconnect()
+            del self.proxy
             self.proxy = None
 
     def _create_receive_task(self, size):
         task = ReceiveTask(size)
+        task.set_error_func(self._connection_error)
+        return task
+
+    def _create_send_task(self, data):
+        task = SendTask(data)
         task.set_error_func(self._connection_error)
         return task
 
@@ -1959,6 +1980,7 @@ class LSClient(WithLogger):
         yield task, self.connection
         self._logger.info("Stage read is done")
         self.proxy.send(data + task.data)
+        self._read_status()
 
     @connection_task
     def _read_tlv_header(self):
@@ -2008,7 +2030,10 @@ class TCPRequestHandler(BaseRequestHandlerDNS):
 
     def get_data(self):
         data = self.request.recv(8192)
-        sz = struct.unpack('>H', data[:2])[0]
+        data_len = len(data)
+        sz = 0
+        if data_len >= 2:
+            sz = struct.unpack('>H', data[:2])[0]
         if sz < len(data) - 2:
             raise Exception("Wrong size of TCP packet")
         elif sz > len(data) - 2:
