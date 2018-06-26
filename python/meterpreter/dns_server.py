@@ -1888,7 +1888,8 @@ class LSClient(WithLogger):
         if data and data == "stager":
             self._read_stage_header()
         else:
-            self._read_status()
+            pass
+            # self._read_status()
 
     def _on_closed_client(self):
         self._logger.info("DNS client is disconnected")
@@ -1906,18 +1907,22 @@ class LSClient(WithLogger):
     def _read_id(self, id_size):
         task = self._create_receive_task(id_size)
         yield task, self.connection
-        self.msf_id = task.data.decode()
-        self._logger.info("Got id = %s", self.msf_id)
+        data = task.data
+        stager = data[-1]
+        self.msf_id = data[:-1].decode()
+        self._logger.info("Got id = %s, stager=%d", self.msf_id, stager)
         self.proxy = self.connector.register_socket(self.msf_id, self)
         self.proxy.set_on_event(self._on_proxy_event)
         if self.proxy.is_paired():
             self._logger.info("New client is found.")
-            if self.proxy._stager:
+            #if self.proxy._stager:
+            if stager == 0x02:
                 self._read_stage_header()
             else:
                 self._read_status()
         else:
             self._logger.info("There are no clients for server id %s. Waiting", self.msf_id)
+            self._read_status()
 
     @connection_task
     def _read_status(self):
@@ -1931,6 +1936,7 @@ class LSClient(WithLogger):
         else:
             self._logger.info("There are no clients, send false")
             send_data = "\x00"
+            self._read_status()
         self._send_status(send_data)
 
     @connection_task

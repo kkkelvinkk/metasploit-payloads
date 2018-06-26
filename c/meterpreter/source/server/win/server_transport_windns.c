@@ -255,7 +255,7 @@ static void cleanup_before_new_request(DnsRequestContext *context)
         context->records = NULL;
     }
     context->start_index = ((UINT)context + GetTickCount()) % 7812;
-    vdprintf("[PACKET NEW REQUEST] random start index is %ud", context->start_index);
+    vdprintf("[PACKET NEW REQUEST] random start index is %u", context->start_index);
 }
 
 static void prepare_data_request(const wchar_t *sub_domain, size_t cur_idx, DnsRequestContext *request_context)
@@ -1469,8 +1469,7 @@ static BOOL server_init_windns(Transport *transport)
         pSrvList->AddrCount = 1;
     }
     ctx->pip4 = (PVOID)pSrvList;
-    wcscpy_s(ctx->sub_seq, 4, L"aaaa"); 
-    ctx->sub_seq[4] = L'\0';
+    wcscpy_s(ctx->sub_seq, sizeof(ctx->sub_seq), L"aaaa"); 
 
     if (ctx->client_id == NULL || ctx->client_id[0] == L'\0' || ctx->client_id[0] == L'0')
     {
