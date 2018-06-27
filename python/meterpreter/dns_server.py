@@ -217,7 +217,9 @@ class RConnection(ReactorObject):
         return len(self.write_queue) != 0
 
     def read_data(self, size):
-        data = self.fd.recv(size)
+        data = ""
+        with ignored(socket.error):
+            data = self.fd.recv(size)
         if size != 0 and len(data) == 0:
             raise RConnection.Closed("Connection is closed")
         return data 
@@ -1086,6 +1088,7 @@ class Client(WithLogger):
         self.registrator = registrator
         self.proxy = None
         self._num_resets = 0
+        self.is_disconnected = threading.Event()
 
     def update_last_request_ts(self):
         self.ts = int(time.time())
@@ -1097,7 +1100,12 @@ class Client(WithLogger):
         with self.lock:
             # msf sends 2 packets after exit packet, but client doesn't request it
             # self.client_queue.empty() and \ 
-            return not self.proxy and not self.received_data.is_complete() 
+            return self.is_disconnected.is_set() 
+
+    def _on_proxy_event(self, event, arg):
+        if event == ProxyConnector.EVENT_DISCONNECTED:
+            self._logger.info("Socket is disconnected.")
+            self.is_disconnected.set()
 
     def register_client(self, server_id, encoder):
         client_id = self.registrator.request_client_id(self)
@@ -1122,7 +1130,6 @@ class Client(WithLogger):
     def _initial_state(self):
         self.state = self.INITIAL
         self.received_data.reset()
-        self.last_received_index = -1
         self.padding = 0
 
     def _reset(self, encoder):
@@ -1131,6 +1138,8 @@ class Client(WithLogger):
         return encoder.encode_service_msg(encoder.MSG_RESET if self._num_resets < 5 else encoder.MSG_SHUTDOWN)
 
     def incoming_data_header(self, data_size, padding, encoder):
+        if self.is_disconnected.is_set():
+            return encoder.encode_service_msg(encoder.MSG_SHUTDOWN)
         if self.received_data.get_expected_size() == data_size and self.state == self.INCOMING_DATA:
             self._logger.info("Duplicated header request: waiting %d bytes of data with padding %d", data_size, padding)
             return encoder.encode_ready_receive()
@@ -1140,12 +1149,18 @@ class Client(WithLogger):
         self._logger.info("Data header: waiting %d bytes of data", data_size)
         if data_size == 0:
             self._logger.error("Data size is zero.")
-            self._reset(encoder)
+            return self._reset(encoder)
         self._setup_receive(data_size, padding)
         return encoder.encode_ready_receive()
 
     def incoming_data(self, data, index, counter, encoder):
+        if self.is_disconnected.is_set():
+            return encoder.encode_service_msg(encoder.MSG_SHUTDOWN)
         self._logger.debug("Data %s, index %d", data, index)
+        if self.last_received_index >= index:
+            self._logger.info("Duplicated packet.")
+            return encoder.encode_send_more_data()
+
         if self.state != self.INCOMING_DATA:
             self._logger.error("Bad state(%d) for this action. Send finish.", self.state)
             return self._reset(encoder)
@@ -1154,10 +1169,6 @@ class Client(WithLogger):
         if data_size == 0:
             self._logger.error("Empty incoming data. Send reset.")
             return self._reset(encoder)
-
-        if self.last_received_index >= index:
-            self._logger.info("Duplicated packet.")
-            return encoder.encode_send_more_data()
 
         try:
             self.received_data.add_part(data)
@@ -1182,6 +1193,8 @@ class Client(WithLogger):
         return encoder.encode_send_more_data()
 
     def request_data_header(self, sub_domain, encoder):
+        if self.is_disconnected.is_set():
+            return encoder.encode_service_msg(encoder.MSG_SHUTDOWN)
         if sub_domain != self.sub_domain:
             self._logger.info("Subdomain is different %s(request) - %s(client)", sub_domain, self.sub_domain)
             next_sub = encoder.get_next_sdomain(self.sub_domain)
@@ -1196,6 +1209,7 @@ class Client(WithLogger):
 
         if not self.proxy:
             self.proxy = self.registrator.register_client_for_server(self.server_id, self)
+            self.proxy.set_on_event(self._on_proxy_event)
 
         if not self.send_data:
             self._logger.info("Checking client queue...")
@@ -1215,6 +1229,8 @@ class Client(WithLogger):
         return encoder.encode_data_header(sub_domain, data_size)
 
     def request_data(self, sub_domain, index, encoder):
+        if self.is_disconnected.is_set():
+            return encoder.encode_service_msg(encoder.MSG_SHUTDOWN)
         self._logger.debug("request_data - %s, %d", sub_domain, index)
         if sub_domain != self.sub_domain:
             self._logger.error("request_data: subdomains are not equal(%s-%s)", self.sub_domain, sub_domain)
@@ -1298,9 +1314,10 @@ class SDnsConnector(WithLogger):
             while client_proxy_ref:
                 client_proxy = client_proxy_ref()
                 if client_proxy:
-                    break
-                else:
-                    client_proxy_ref = clients.popleft()        
+                    if hasattr(client_proxy, "is_hang"):
+                        if not client_proxy.is_hang():
+                            break
+                client_proxy_ref = clients.popleft()        
         return client_proxy
 
     def _find_other_proxy_stager(self, stagerMap, server_id):
@@ -1484,9 +1501,17 @@ class ProxySocket(BaseProxy):
         self._client = client
         self._connector._attach_queue_callback(WeakMethod(self._notify))
         self._stager = stager
+        self.ts = int(time.time())
 
     def _notify(self):
         self._client._notify_new_data()
+
+    def update_ts(self):
+        self.ts = int(time.time())
+
+    def is_hang(self):
+        now = int(time.time())
+        return (now - self.ts) > 20 
 
 
 class ProxyDNS(BaseProxy):
@@ -1953,15 +1978,23 @@ class LSClient(WithLogger):
         task = self._create_receive_task(1)
         yield task, self.connection
         self._logger.info("Status request is read")
-        send_data = "\x01"
-        if self.proxy.is_paired():
-            self._logger.info("Client is exists, send true")
-            self._read_tlv_header()
+        if self.proxy.is_hang():
+            self._logger.info("Connection looks like as hanged.Close it.")
+            self.proxy.disconnect()
+            del self.proxy
+            self.proxy = None
+            self.connection.close()
         else:
-            self._logger.info("There are no clients, send false")
-            send_data = "\x00"
-            self._read_status()
-        self._send_status(send_data)
+            self.proxy.update_ts()
+            send_data = "\x01"
+            if self.proxy.is_paired():
+                self._logger.info("Client is exists, send true")
+                self._read_tlv_header()
+            else:
+                self._logger.info("There are no clients, send false")
+                send_data = "\x00"
+                self._read_status()
+            self._send_status(send_data)
 
     @connection_task
     def _send_status(self, data):
@@ -2005,13 +2038,6 @@ class LSClient(WithLogger):
         self._logger.info("All data from socket is read. Sending to client.")
         self.proxy.send(data + task.data)
         self._read_tlv_header()
-
-    def request_stage(self):
-        if not self.stage_requested:
-            self._read_stage_header()
-            self.stage_requested = True
-        else:
-            self._logger.info("Stage has already was requested on this server")
 
 
 class MSFConnectionFactory(RConnectionFactory):
