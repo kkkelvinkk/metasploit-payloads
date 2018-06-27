@@ -608,6 +608,7 @@ class SendTask(RConnectionTask):
         self.error_func = error_func
 
     @RConnectionTask.work_f
+
     def _send_data(self, connection):
         num_send = connection.send_data(self.data[self.idx:])
         self.need_send -= num_send
@@ -1847,31 +1848,6 @@ def dns_response(data, transport):
         logger.error("Exception during handle request " + str(e), exc_info=True)
 
 
-class BaseRequestHandlerDNS(SocketServer.BaseRequestHandler):
-    TRANSPORT_UDP = 1
-    TRANSPORT_TCP = 2
-    TRANSPORT = TRANSPORT_UDP
-
-    def get_data(self):
-        raise NotImplementedError
-
-    def send_data(self, data):
-        raise NotImplementedError
-
-    def handle(self):
-        logger.info("DNS request %s (%s %s):", self.__class__.__name__[:3], self.client_address[0],
-                    self.client_address[1])
-        try:
-            data = self.get_data()
-            logger.debug("Size:%d, data %s", len(data), data)
-            dns_ans = dns_response(data, self.TRANSPORT)
-            if dns_ans:
-                with ignored(socket.error):
-                    self.send_data(dns_ans)
-        except Exception:
-            logger.error("Exception in request handler.", exc_info=True)
-
-
 class LSClient(WithLogger):
     """
     Listener side client. It handles socket connection that
@@ -1899,7 +1875,6 @@ class LSClient(WithLogger):
         self._logger.info("Error or closed connection")
         if self.proxy:
             self.proxy.disconnect()
-            self._logger.info("Refs %d", sys.getrefcount(self.proxy))
             del self.proxy
             self.proxy = None
 
@@ -2051,6 +2026,31 @@ class MSFConnectionFactory(RConnectionFactory):
         client = LSClient(connection, self.connector)
         self.clients.append(client)
         return connection
+
+
+class BaseRequestHandlerDNS(SocketServer.BaseRequestHandler):
+    TRANSPORT_UDP = 1
+    TRANSPORT_TCP = 2
+    TRANSPORT = TRANSPORT_UDP
+
+    def get_data(self):
+        raise NotImplementedError
+
+    def send_data(self, data):
+        raise NotImplementedError
+
+    def handle(self):
+        logger.info("DNS request %s (%s %s):", self.__class__.__name__[:3], self.client_address[0],
+                    self.client_address[1])
+        try:
+            data = self.get_data()
+            logger.debug("Size:%d, data %s", len(data), data)
+            dns_ans = dns_response(data, self.TRANSPORT)
+            if dns_ans:
+                with ignored(socket.error):
+                    self.send_data(dns_ans)
+        except Exception:
+            logger.error("Exception in request handler.", exc_info=True)
 
 
 class TCPRequestHandler(BaseRequestHandlerDNS):
