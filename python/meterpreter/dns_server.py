@@ -67,6 +67,22 @@ class WithLogger(object):
     __slots__ = []
 
 
+class WeakMethod(object):
+    __slots__ = "_self", "_func"
+
+    def __init__(self, method):
+        self._self = weakref.ref(method.im_self)
+        self._func = method.im_func
+
+    def __call__(self, *args, **kwargs):
+        result = None
+        if self._self:
+            _self = self._self()
+            if _self:
+                result = self._func(_self, *args, **kwargs)
+        return result
+
+
 def pack_byte_to_hn(val):
     """
     Pack byte to network order unsigned short
@@ -1165,12 +1181,12 @@ class Client(WithLogger):
         if sub_domain != self.sub_domain:
             self._logger.info("Subdomain is different %s(request) - %s(client)", sub_domain, self.sub_domain)
             next_sub = encoder.get_next_sdomain(self.sub_domain)
-            if sub_domain != next_sub:
+            if sub_domain == "aaaa":
+                self._logger.info("MIGRATION.")
+            elif sub_domain != next_sub:
                 # if not the next sub_domain then reset it
                 return self._reset(encoder) 
 
-            if sub_domain == "aaaa":
-                self._logger.info("MIGRATION.")
             self.sub_domain = sub_domain
             self.send_data = None
 
@@ -1265,6 +1281,7 @@ class SDnsConnector(WithLogger):
     """
     def __init__(self):
         self.socketClientMap = {}
+        self.socketStagerMap = {}
         self.dnsClientMap = {}
         self.dnsStagerMap = {}
         self.lock = threading.RLock()
@@ -1282,6 +1299,14 @@ class SDnsConnector(WithLogger):
                     client_proxy_ref = clients.popleft()        
         return client_proxy
 
+    def _find_other_proxy_stager(self, stagerMap, server_id):
+        stager_proxy = None
+        with self.lock, ignored(KeyError):
+            stager_ref = stagerMap.pop(server_id)
+            if stager_ref:
+                stager_proxy = stager_ref()
+        return stager_proxy 
+
     def _update_map(self, clientMap, server_id, proxy):
         with self.lock:
             if not proxy.is_paired():
@@ -1291,27 +1316,27 @@ class SDnsConnector(WithLogger):
     def _append_socket(self, server_id, proxy):
         self._update_map(self.socketClientMap, server_id, proxy)
 
-    def register_socket(self, server_id, client):
+    def register_socket(self, server_id, client, stager):
         if len(server_id) == 0 or not client:
             raise RuntimeError("Server id or connection is not defined") 
+        self._logger.info("Sockets %s", self.socketClientMap)
         # find waited clients on dnsClientMap
-        other_proxy = self._find_other_proxy(self.dnsClientMap, server_id)
-        stager = False
-        proxy_st = None
-        if not other_proxy:
-            # check stagers
-            self._logger.info("DNS clients is not found.Look at stagers")
+        other_proxy = None
+        if stager:
             with self.lock, ignored(KeyError):
-                self._logger.info("stagers %s", self.dnsStagerMap)
-                other_proxy = self.dnsStagerMap.pop(server_id)
-                proxy_st = other_proxy
-                self._logger.info("Connector created")
-                stager = True
-    
+                stager_ref = self.dnsStagerMap.pop(server_id)
+                if stager_ref:
+                    other_proxy = stager_ref()
+        else:
+            other_proxy = self._find_other_proxy(self.dnsClientMap, server_id)
         proxy = ProxySocket(client, other_proxy, stager)
-        if proxy_st:
-            proxy_st.detach_func = partial(self._detach_stager, server_id, weakref.ref(proxy))
-        self._update_map(self.socketClientMap, server_id, proxy)
+        if stager and other_proxy:
+            other_proxy.detach_func = partial(self._detach_stager, server_id, weakref.ref(proxy))
+        if stager:
+            with self.lock:
+                self.socketStagerMap[server_id] = weakref.ref(proxy)
+        else:
+            self._update_map(self.socketClientMap, server_id, proxy)
         return proxy
 
     def register_dns(self, server_id):
@@ -1337,15 +1362,15 @@ class SDnsConnector(WithLogger):
             if proxy:
                 return proxy
             else:
+                s_proxy_ref = None
                 s_proxy = None
-                socket_proxies = self.socketClientMap.get(server_id, deque())
-                with ignored(IndexError):
-                    s_proxy = socket_proxies.popleft()
-                proxy_ref = None
-                if s_proxy:
-                    s_proxy._stager = True
-                    proxy_ref = weakref.ref(s_proxy)
-                _detach_func = partial(self._detach_stager, server_id, proxy_ref) if s_proxy else None
+                with ignored(KeyError):
+                    s_proxy_ref = self.socketStagerMap.pop(server_id)
+                if s_proxy_ref:
+                    s_proxy = s_proxy_ref()
+                    if s_proxy:
+                        s_proxy._stager = True
+                _detach_func = partial(self._detach_stager, server_id, s_proxy_ref) if s_proxy else None
                 proxy = ProxyStager(s_proxy, detach_func=_detach_func)
                 if not proxy.is_paired():
                     self._logger.info("Append stager for waiting clients(%s)", server_id)
@@ -1453,7 +1478,7 @@ class ProxySocket(BaseProxy):
     def __init__(self, client, proxy=None, stager=False):
         super(ProxySocket, self).__init__(proxy)
         self._client = client
-        self._connector._attach_queue_callback(self._notify)
+        self._connector._attach_queue_callback(WeakMethod(self._notify))
         self._stager = stager
 
     def _notify(self):
@@ -1871,6 +1896,7 @@ class LSClient(WithLogger):
         self._logger.info("Error or closed connection")
         if self.proxy:
             self.proxy.disconnect()
+            self._logger.info("Refs %d", sys.getrefcount(self.proxy))
             del self.proxy
             self.proxy = None
 
@@ -1907,7 +1933,8 @@ class LSClient(WithLogger):
     def _on_new_client(self, data):
         self._logger.info("Association with DNS client is done")
         if data and data == "stager":
-            self._read_stage_header()
+            pass
+            # self._read_stage_header()
         else:
             pass
             # self._read_status()
@@ -1932,15 +1959,13 @@ class LSClient(WithLogger):
         stager = data[-1]
         self.msf_id = data[:-1].decode()
         self._logger.info("Got id = %s, stager=%d", self.msf_id, stager)
-        self.proxy = self.connector.register_socket(self.msf_id, self)
+        self.proxy = self.connector.register_socket(self.msf_id, self, stager==0x02)
         self.proxy.set_on_event(self._on_proxy_event)
-        if self.proxy.is_paired():
+        if stager == 0x02:
+            self._read_stage_header()
+        elif self.proxy.is_paired():
             self._logger.info("New client is found.")
-            #if self.proxy._stager:
-            if stager == 0x02:
-                self._read_stage_header()
-            else:
-                self._read_status()
+            self._read_status()
         else:
             self._logger.info("There are no clients for server id %s. Waiting", self.msf_id)
             self._read_status()
