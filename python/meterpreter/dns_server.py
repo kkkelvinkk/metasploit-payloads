@@ -340,15 +340,18 @@ class FDReactor(WithLogger):
         self.tasks = []
         self.task_lock = threading.RLock()
 
-    def create_listener(self, addr, port, listener_factory=RListenerFactory(), monitor=True):
+    def create_listener(self, addr, port, listener_factory=RListenerFactory(), monitor=True, allow_reuse=True):
         self._logger.debug("Creating listener for %s:%d", addr, port)
         listener = None
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setblocking(False)
+        if allow_reuse:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
         try:
             sock.bind((addr, port))
         except socket.error as e:
+            self._logger.info("Exception during bind listener on the %s:%d", addr, port)
             if e.args[0] == errno.EADDRINUSE:
                 return listener
             else:
@@ -2080,6 +2083,14 @@ class UDPRequestHandler(BaseRequestHandlerDNS):
         return self.request[1].sendto(data, self.client_address)
 
 
+class DnsTcpServer(SocketServer.TCPServer):
+    allow_reuse_address = True
+
+
+class DnsUdpServer(SocketServer.UDPServer):
+    allow_reuse_address = True
+
+
 class ServerBuilder(object):
     """
     Build server based on command line arguments or config file
@@ -2118,8 +2129,8 @@ class ServerBuilder(object):
         listener_task = DefferedTask(reactor.create_listener, msf_addr if msf_addr else '0.0.0.0', msf_port, listener_factory=listener_factory)
         self._append_to_seq(listener_task)
 
-        servers = [SocketServer.UDPServer(('', dns_port), UDPRequestHandler),
-                   SocketServer.TCPServer(('', dns_port), TCPRequestHandler)]
+        servers = [DnsUdpServer(('', dns_port), UDPRequestHandler),
+                   DnsTcpServer(('', dns_port), TCPRequestHandler)]
 
         def _start_server(s):
             thread = threading.Thread(target=s.serve_forever)  # that thread will start one more thread for each request
