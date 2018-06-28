@@ -2137,8 +2137,8 @@ class ServerBuilder(object):
     def setup_cmd_args(self, args):
         reactor = FDReactor()
         dns_addr, dns_port = self._parse_addr_port(args.dnsaddr)
-        if not dns_addr and not args.ipaddr:
-            logger.error("should indicated one ip address for DNS(ip value in --dnsaddr or in --ipaddr parameter")
+        if not dns_addr:
+            logger.error("should indicated ip address for DNS(ip value in --dnsaddr")
             return False
         
         connector = SDnsConnector()
@@ -2146,8 +2146,7 @@ class ServerBuilder(object):
         timeout_service_stop = DefferedTask(timeout_service.shutdown)
         self._append_to_seq(None, timeout_service_stop)
         registrator = Registrator(connector, timeout_service)
-        start_dns_task = DefferedTask(DnsServer.create, args.domain, 
-                                      dns_addr if dns_addr else args.ipaddr, registrator)
+        start_dns_task = DefferedTask(DnsServer.create, args.domain, dns_addr, registrator)
         self._append_to_seq(start_dns_task)
 
         msf_addr, msf_port = self._parse_addr_port(args.laddr)
@@ -2201,7 +2200,6 @@ def main():
     parser.add_argument('--dnsaddr', default="53", type=str, help='The DNS [addr:]port to listen on.')
     parser.add_argument('--laddr', default="4444", type=str, help='The Meterpreter [addr:]port to listen on.')
     parser.add_argument('--domain', '-D', action='append', type=str, required=True, help='The domain name.')
-    parser.add_argument('--ipaddr', type=str, required=True, help='DNS IP')
     parser.add_argument('--config', type=str, help='Configuration file')
     args = parser.parse_args()
     
