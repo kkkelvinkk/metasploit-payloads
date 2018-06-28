@@ -2155,8 +2155,8 @@ class ServerBuilder(object):
         listener_task = DefferedTask(reactor.create_listener, msf_addr if msf_addr else '0.0.0.0', msf_port, listener_factory=listener_factory)
         self._append_to_seq(listener_task)
 
-        servers = [DnsUdpServer(('', dns_port), UDPRequestHandler),
-                   DnsTcpServer(('', dns_port), TCPRequestHandler)]
+        servers = [DnsUdpServer((dns_addr, dns_port), UDPRequestHandler),
+                   DnsTcpServer((dns_addr, dns_port), TCPRequestHandler)]
 
         def _start_server(s):
             thread = threading.Thread(target=s.serve_forever)  # that thread will start one more thread for each request
