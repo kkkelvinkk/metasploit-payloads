@@ -1063,7 +1063,7 @@ BOOL get_packet_from_windns(WORD request_type, wchar_t *domain, wchar_t *sub_seq
 
         if (need_to_receive == 0)
         {
-            receive->status = DNS_INFO_NO_RECORDS;
+            receive->status = eSTATUS_DNS_NO_RECORDS;
             receive->size = 0;
             vdprintf("[PACKET RECEIVE WINDNS] NO RECORDS");
         }
@@ -1561,6 +1561,10 @@ static DWORD server_dispatch_dns(Remote *remote, THREAD *dispatchThread)
                 dprintf("[DISPATCH] Shutdown dispatch loop");
                 result = ERROR_SUCCESS;
                 break;
+            }
+            else if (dns_status == eSTATUS_DNS_NO_RECORDS)
+            {
+                transport->comms_last_packet = current_unix_timestamp();
             }
 
             delay = 10 * ecount;
