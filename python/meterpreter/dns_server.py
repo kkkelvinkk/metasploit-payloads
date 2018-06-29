@@ -1304,6 +1304,7 @@ class SDnsConnector(WithLogger):
         self.socketStagerMap = {}
         self.dnsClientMap = {}
         self.dnsStagerMap = {}
+        self.proxyStagerLst = deque()
         self.lock = threading.RLock()
 
     def _find_other_proxy(self, clientMap, server_id):
@@ -1373,7 +1374,11 @@ class SDnsConnector(WithLogger):
             r = proxy_ref()
             if r:
                 r._connector._paired.clear()
-                self._append_socket(server_id, r)
+                if r.cloned:
+                    with ignored(ValueError):
+                        self.proxyStagerLst.remove(r)
+                else:
+                    self._append_socket(server_id, r)
 
     def register_stager(self, server_id):
         if len(server_id) == 0:
@@ -1383,14 +1388,13 @@ class SDnsConnector(WithLogger):
             if proxy:
                 return proxy
             else:
-                s_proxy_ref = None
                 s_proxy = None
-                with ignored(KeyError):
-                    s_proxy_ref = self.socketStagerMap.pop(server_id)
+                s_proxy_ref = self.socketStagerMap.pop(server_id, None)
                 if s_proxy_ref:
                     s_proxy = s_proxy_ref()
                     if s_proxy:
                         s_proxy._stager = True
+                        self._logger.info("Found proxy for stager client")
                 _detach_func = partial(self._detach_stager, server_id, s_proxy_ref) if s_proxy else None
                 proxy = ProxyStager(s_proxy, detach_func=_detach_func)
                 if not proxy.is_paired():
@@ -1403,12 +1407,13 @@ class SDnsConnector(WithLogger):
             proxy_socket.send(data)
             if not proxy_socket.is_paired():
                 proxy_stager = proxy_socket._clone_stager()
+                self.proxyStagerLst.append(proxy_stager)
                 self._append_socket(server_id, proxy_socket)
                 old_proxy = self.socketStagerMap.pop(server_id, None)
                 if old_proxy and old_proxy() == proxy_socket:
                     self.socketStagerMap[server_id] = weakref.ref(proxy_stager)
                 else:
-                    self._logger.info("old proxy is not equal stager proxy")
+                    self._logger.error("old proxy is not equal stager proxy")
 
 
 class LQueue(object):
@@ -1514,10 +1519,12 @@ class ProxySocket(BaseProxy):
         self._connector._attach_queue_callback(WeakMethod(self._notify))
         self._stager = stager
         self.ts = int(time.time())
+        self.cloned = False
 
     def _clone_stager(self):
         proxy = ProxySocket(None, None, True)
         proxy._connector = self._connector
+        proxy.cloned = True
         self._connector = ProxyConnector()
         self.update_ts()
         return proxy
