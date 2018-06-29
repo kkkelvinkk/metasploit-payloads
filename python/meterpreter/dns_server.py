@@ -1397,6 +1397,18 @@ class SDnsConnector(WithLogger):
                     self._logger.info("Append stager for waiting clients(%s)", server_id)
                     self.dnsStagerMap[server_id] = proxy
         return proxy
+    
+    def send_stage(self, proxy_socket, server_id, data):
+        with self.lock:
+            proxy_socket.send(data)
+            if not proxy_socket.is_paired():
+                proxy_stager = proxy_socket._clone_stager()
+                self._append_socket(server_id, proxy_socket)
+                old_proxy = self.socketStagerMap.pop(server_id, None)
+                if old_proxy and old_proxy() == proxy_socket:
+                    self.socketStagerMap[server_id] = weakref.ref(proxy_stager)
+                else:
+                    self._logger.info("old proxy is not equal stager proxy")
 
 
 class LQueue(object):
@@ -1503,8 +1515,16 @@ class ProxySocket(BaseProxy):
         self._stager = stager
         self.ts = int(time.time())
 
+    def _clone_stager(self):
+        proxy = ProxySocket(None, None, True)
+        proxy._connector = self._connector
+        self._connector = ProxyConnector()
+        self.update_ts()
+        return proxy
+
     def _notify(self):
-        self._client._notify_new_data()
+        if self._client:
+            self._client._notify_new_data()
 
     def update_ts(self):
         self.ts = int(time.time())
@@ -2015,7 +2035,7 @@ class LSClient(WithLogger):
         task = self._create_receive_task(stage_size)
         yield task, self.connection
         self._logger.info("Stage read is done")
-        self.proxy.send(data + task.data)
+        self.connector.send_stage(self.proxy, self.msf_id, data + task.data)
         self._read_status()
 
     @connection_task
