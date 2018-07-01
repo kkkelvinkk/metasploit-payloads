@@ -1399,7 +1399,7 @@ class SDnsConnector(WithLogger):
                 proxy = ProxyStager(s_proxy, detach_func=_detach_func)
                 if not proxy.is_paired():
                     self._logger.info("Append stager for waiting clients(%s)", server_id)
-                    self.dnsStagerMap[server_id] = proxy
+                    self.dnsStagerMap[server_id] = weakref.ref(proxy)
         return proxy
     
     def send_stage(self, proxy_socket, server_id, data):
