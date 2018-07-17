@@ -1865,25 +1865,31 @@ class DnsServer(WithLogger):
             sub_domain = qname[:i]
         return sub_domain
 
+    def _get_sub_and_domain(self, qname, domain):
+        qname_l = qname.lower()
+        domain_l = domain.lower()
+        sub_domain = self._get_subdomain(qname_l, domain_l)
+        return sub_domain, domain_l
+
     def _process_ns_request(self, reply, qname, domain):
-        sub_domain = self._get_subdomain(qname, domain)
+        sub_domain, domain = self._get_sub_and_domain(qname, domain)
         for record in self.domains[domain].get_records(sub_domain, DomainDB.NS_TYPE):
             self._logger.info("Send answer for NS request - %s", record)
             reply.add_answer(RR(rname=qname, rtype=QTYPE.NS, rclass=1, ttl=1, rdata=NS(record)))
 
     def _process_a_request(self, reply, qname, domain):
-        sub_domain = self._get_subdomain(qname, domain)
+        sub_domain, domain = self._get_sub_and_domain(qname, domain)
         for record in self.domains[domain].get_records(sub_domain, DomainDB.A_TYPE):
             self._logger.info("Send answer for A request - %s", record)
             reply.add_answer(RR(rname=qname, rtype=QTYPE.A, rclass=1, ttl=1, rdata=A(record)))
 
     def _process_aaaa_request(self, reply, qname, domain):
-        sub_domain = self._get_subdomain(qname, domain)
+        sub_domain, domain = self._get_sub_and_domain(qname, domain)
         for record in self.domains[domain].get_records(sub_domain, DomainDB.AAAA_TYPE):
             reply.add_answer(RR(rname=qname, rtype=QTYPE.AAAA, rclass=1, ttl=1, rdata=AAAA(record)))
 
     def _process_dnskey_request(self, reply, qname, domain):
-        sub_domain = self._get_subdomain(qname, domain)
+        sub_domain, domain = self._get_sub_and_domain(qname, domain)
         for record in self.domains[domain].get_records(sub_domain, DomainDB.DNSKEY_TYPE):
             reply.add_answer(RR(rname=qname, rtype=QTYPE.DNSKEY, rclass=1, ttl=1, rdata=record))
 
