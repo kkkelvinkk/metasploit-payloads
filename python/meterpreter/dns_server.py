@@ -1526,6 +1526,7 @@ class ProxySocket(BaseProxy):
         proxy._connector = self._connector
         proxy.cloned = True
         self._connector = ProxyConnector()
+        self._connector._attach_queue_callback(WeakMethod(self._notify))
         self.update_ts()
         return proxy
 
