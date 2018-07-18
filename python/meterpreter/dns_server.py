@@ -1838,10 +1838,11 @@ class DnsServer(WithLogger):
     def process_request(self, request, transport):
         reply = DNSRecord(DNSHeader(id=request.header.id, qr=1, aa=1, ra=1), q=request.q)
         qn = str(request.q.qname)
+        qn_l = qn.lower()
         qtype = request.q.qtype
         qt = QTYPE[qtype]
         for domain in self.domains:
-            if qn.endswith(domain):
+            if qn_l.endswith(domain):
                 try:
                     self._logger.info("Process request for type %s", qt)
                     self.handlers[qtype](reply, qn, domain)
