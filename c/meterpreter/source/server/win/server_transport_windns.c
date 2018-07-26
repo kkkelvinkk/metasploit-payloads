@@ -1609,6 +1609,7 @@ static void transport_destroy_dns(Transport *transport)
         ctx->ready = FALSE;
     }
     SAFE_FREE(transport);
+    WSACleanup();
 }
 
 void transport_write_dns_config(Transport *transport, MetsrvTransportDns *config)
@@ -1707,6 +1708,9 @@ Transport *transport_create_dns(MetsrvTransportDns *config)
     transport->ctx = ctx;
     transport->comms_last_packet = current_unix_timestamp();
 
+    //init sockets as sockets can be used in extensions
+    WSADATA wsaData;
+    WSAStartup(0x202, &wsaData);
     return transport;
 }
 
