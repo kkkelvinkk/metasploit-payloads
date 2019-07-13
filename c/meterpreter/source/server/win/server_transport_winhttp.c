@@ -68,7 +68,7 @@ static HINTERNET get_request_winhttp(HttpTransportContext *ctx, BOOL isGet, cons
 					}
 					else if (ieConfig.lpszAutoConfigUrl)
 					{
-						dprintf("[PROXY] IE config set to autodetect with URL %S", ieConfig.lpszAutoConfigUrl);
+						dprintf("[PROXY] IE config set to autodetect and AutoConfigUrl with URL %S", ieConfig.lpszAutoConfigUrl);
 
 						autoProxyOpts.dwFlags = WINHTTP_AUTOPROXY_CONFIG_URL;
 						autoProxyOpts.dwAutoDetectFlags = 0;
@@ -81,6 +81,42 @@ static HINTERNET get_request_winhttp(HttpTransportContext *ctx, BOOL isGet, cons
 						ctx->proxy_for_url = malloc(sizeof(WINHTTP_PROXY_INFO));
 						memcpy(ctx->proxy_for_url, &proxyInfo, sizeof(WINHTTP_PROXY_INFO));
 					}
+					else if (ieConfig.lpszAutoConfigUrl)
+					{
+						// Modified by Kelvin Yip
+						// Handle AutoDetect + AutoConfigUrl
+						// The only problem is Win 10 1903 + https pac file
+                                                dprintf("[PROXY] IE config set to autodetect with URL %S", ieConfig.lpszAutoConfigUrl);
+
+                                                autoProxyOpts.dwFlags = WINHTTP_AUTOPROXY_CONFIG_URL;
+                                                autoProxyOpts.dwAutoDetectFlags = 0;
+                                                autoProxyOpts.lpszAutoConfigUrl = ieConfig.lpszAutoConfigUrl;
+
+						if (WinHttpGetProxyForUrl(ctx->internet, ctx->url, &autoProxyOpts, &proxyInfo))
+						{
+							ctx->proxy_for_url = malloc(sizeof(WINHTTP_PROXY_INFO));
+							memcpy(ctx->proxy_for_url, &proxyInfo, sizeof(WINHTTP_PROXY_INFO));
+						}
+					}
+					else if (ieConfig.lpszProxy)
+					{
+						// Modified by Kelvin Yip
+						// Handle AutoDetect + ieConfig.lpszProxy
+						WINHTTP_PROXY_INFO* proxyInfo = (WINHTTP_PROXY_INFO*)calloc(1, sizeof(WINHTTP_PROXY_INFO));
+						ctx->proxy_for_url = proxyInfo;
+
+						dprintf("[PROXY] IE config set to proxy %S with bypass %S", ieConfig.lpszProxy, ieConfig.lpszProxyBypass);
+
+						proxyInfo->dwAccessType = WINHTTP_ACCESS_TYPE_NAMED_PROXY;
+						proxyInfo->lpszProxy = ieConfig.lpszProxy;
+						proxyInfo->lpszProxyBypass = ieConfig.lpszProxyBypass;
+
+						// stop the cleanup code from removing these as we're using them behind the scenes and they will
+						// be freed later instead.
+						ieConfig.lpszProxy = NULL;
+						ieConfig.lpszProxyBypass = NULL;;
+					}
+
 				}
 				else if (ieConfig.lpszProxy)
 				{
